@@ -53,6 +53,9 @@ Switch Control to "Manual", then use the keyboard with the controller window foc
 __Auto Mode (person tracking):__
 With "Person detection" on, the drone keeps the group of detected people centred (smooth proportional control) and holds a set distance. With nobody in view it turns in place to search. Detection runs in a background thread so video and controls stay smooth.
 
+__Flight Plans (waypoints):__
+Click the flight map to add waypoints (right-click removes the last one); positions are relative to the takeoff point, with "up" on the map being the direction the drone faces at takeoff. The grid is 1 m. "Run" takes off if needed, flies to each waypoint in order, then returns home and lands. Combined with Search & Rescue mode this scans an area and marks sightings on the map. Manual keys, low battery, emergency stop or "Stop" end the plan. Plans can be saved to and loaded from `plans/*.json`. Like return home, positions are estimated (no GPS), so expect drift of a meter or two.
+
 __Mission Modes:__
 Operational labels people as Ally (large/close) or Hostile (small/far); this is a size heuristic, not identification. Search & Rescue labels everyone "Person Detected", saves a photo every 3 s while people are in view in flight, and marks each sighting on the flight map.
 

@@ -25,6 +25,8 @@ def make_controller():
     c.interval, c.speed = 0.25, 50
     c.x, c.y, c.z, c.yaw0 = 0.0, 0.0, 0, 0
     c.home, c.returning, c.rth_triggered = (0.0, 0.0), False, False
+    c.waypoints, c.plan_active, c.plan_index = [], False, 0
+    c.update_plan_label = c.draw_minimap = lambda: None
     c.points, c.person_points = [], []
     c.prev_err_x, c.searching = 0, False
     c.pressed_keys = set()
@@ -196,6 +198,80 @@ class ReturnHomeTest(unittest.TestCase):
         c.is_flying, c.returning, c.manual_control_enabled = True, True, True
         c.on_key_press(mock.Mock(keysym="Up"))
         self.assertFalse(c.returning)
+
+
+class FlightPlanTest(unittest.TestCase):
+    def fly(self, c, steps):
+        sim = {"yaw": 0.0}
+        visited = []
+        with mock.patch.object(dc.me, "get_yaw", side_effect=lambda: int(sim["yaw"])), \
+                mock.patch.object(dc.me, "get_height", return_value=100):
+            for _ in range(steps):
+                if c.returning:
+                    rc = c.return_home_rc()
+                elif c.plan_active:
+                    index = c.plan_index
+                    rc = c.plan_rc()
+                    if c.plan_index != index:
+                        visited.append(index)
+                else:
+                    break
+                sim["yaw"] = dc.wrap_degrees(sim["yaw"] + rc[3] * c.interval)
+                c.log_flight_path(*rc)
+        return visited
+
+    def test_visits_waypoints_in_order_then_returns_home_and_lands(self):
+        c = make_controller()
+        c.is_flying = True
+        c.land = mock.MagicMock()
+        c.waypoints = [(0, 200), (200, 200), (200, 0)]  # a square: forward, right, back
+        c.toggle_plan()
+        visited = self.fly(c, 800)
+        self.assertEqual(visited, [0, 1, 2])
+        c.land.assert_called_once()
+        self.assertLess(c.home_distance(), dc.RTH_ARRIVE)
+
+    def test_waypoints_are_relative_to_takeoff_point(self):
+        c = make_controller()
+        c.x, c.y = 300.0, 400.0  # landed here; this becomes home at takeoff
+        c.waypoints = [(100, 0)]
+        self.assertEqual(c.plan_targets(), [(400.0, 400.0)])
+
+    def test_run_while_landed_takes_off_and_cancelled_by_failed_preflight(self):
+        c = make_controller()
+        c.waypoints = [(0, 100)]
+        c.takeoff = mock.MagicMock(side_effect=lambda: setattr(c, "busy", True))
+        c.toggle_plan()
+        c.takeoff.assert_called_once()
+        self.assertTrue(c.plan_active)
+        c2 = make_controller()
+        c2.waypoints = [(0, 100)]
+        c2.takeoff = mock.MagicMock()  # preflight refused: never busy
+        c2.toggle_plan()
+        self.assertFalse(c2.plan_active)
+
+    def test_manual_key_and_low_battery_stop_the_plan(self):
+        c = make_controller()
+        c.is_flying, c.plan_active, c.manual_control_enabled, c.waypoints = True, True, True, [(0, 500)]
+        c.on_key_press(mock.Mock(keysym="Left"))
+        self.assertFalse(c.plan_active)
+        c.plan_active, c.x = True, 300.0
+        c.check_battery(dc.RTH_BATTERY)
+        self.assertFalse(c.plan_active)
+        self.assertTrue(c.returning)
+
+    def test_plan_files_are_validated(self):
+        d = tempfile.mkdtemp()
+        good, bad, far = (os.path.join(d, n) for n in ("good.json", "bad.json", "far.json"))
+        with open(good, "w") as f:
+            f.write('{"waypoints": [[0, 100], [50.5, 0]]}')
+        with open(bad, "w") as f:
+            f.write('{"waypoints": [["rm -rf", 1]]}')
+        with open(far, "w") as f:
+            f.write('{"waypoints": [[0, 99999]]}')
+        self.assertEqual(dc.parse_plan(good), [(0.0, 100.0), (50.5, 0.0)])
+        self.assertRaises(ValueError, dc.parse_plan, bad)
+        self.assertRaises(ValueError, dc.parse_plan, far)
 
 
 class FlightLogTest(unittest.TestCase):

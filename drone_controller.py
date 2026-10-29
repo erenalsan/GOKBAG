@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import math
+import json
 import signal
 import subprocess
 import threading
@@ -10,7 +11,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 import customtkinter
-from tkinter import Label, Canvas
+from tkinter import Label, Canvas, filedialog
 from utilities.yolo_model import YOLOModel
 import utilities.coord_csv_module as ccsv
 
@@ -23,6 +24,7 @@ else:
     me = Tello()
 
 GREEN, GREEN_HOVER, RED, RED_HOVER, AMBER, MUTED = "#2fa572", "#258a5e", "#d64545", "#b33838", "#e0a526", "gray60"
+BLUE = "#5aa9e6"
 
 # Safety limits
 MIN_TAKEOFF_BATTERY = 20   # % preflight check
@@ -46,6 +48,7 @@ RTH_SPEED = 40             # rc forward value on the way home
 RTH_ARRIVE = 30            # estimated distance at which it lands
 RTH_HEADING_KP = 1.5       # degrees of heading error -> rc yaw
 RTH_ALIGNED = 15           # degrees; flies forward only when roughly facing home
+MAP_MIN_SPAN = 600         # the flight map always shows at least ~6 m, so waypoints can be placed
 
 # Tk keysym -> (axis index in [lr, fb, ud, yv], sign)
 KEY_BINDINGS = {
@@ -63,6 +66,16 @@ def clamp(value, limit):
 
 def wrap_degrees(angle):
     return (angle + 180) % 360 - 180
+
+
+def parse_plan(filename):
+    with open(filename) as f:
+        waypoints = json.load(f)["waypoints"]
+    # files can come from anywhere: accept only a list of numeric pairs within 50 m of takeoff
+    plan = [(float(dx), float(dy)) for dx, dy in waypoints]
+    if not plan or any(math.hypot(dx, dy) > 5000 for dx, dy in plan):
+        raise ValueError("expected 1+ waypoints within 50 m of takeoff")
+    return plan
 
 
 class DroneController:
@@ -101,6 +114,11 @@ class DroneController:
         self.auto_landed = False
         self.returning = False
         self.rth_triggered = False
+        self.waypoints = []        # (dx, dy) offsets from the takeoff point, +y = takeoff heading
+        self.plan_active = False
+        self.plan_index = 0
+        self.map_transform = None
+        self.update_plan_label()
 
         self.width = 640
         self.height = 480
@@ -147,6 +165,8 @@ class DroneController:
         bottom.pack(fill="x", padx=14, pady=(0, 14))
         self.map_canvas = Canvas(bottom, width=330, height=150, bg="#1a1a1a", bd=0, highlightthickness=0)
         self.map_canvas.pack(side="left")
+        self.map_canvas.bind("<Button-1>", self.add_waypoint)
+        self.map_canvas.bind("<Button-3>", self.remove_last_waypoint)
         self.keys_label = customtkinter.CTkLabel(bottom, justify="left", text_color=MUTED, font=customtkinter.CTkFont(family="monospace", size=12),
                                                  text="↑ ↓ ← →  move\nW / S    up / down\nA / D    rotate\nE / Q    take off / land\nH        return home\nSPACE    emergency stop")
         self.keys_label.pack(side="right", anchor="n")
@@ -204,6 +224,18 @@ class DroneController:
         self.yolo_switch = customtkinter.CTkSwitch(control, text="Person detection", command=self.toggle_yolo)
         self.yolo_switch.select()
         self.yolo_switch.pack(anchor="w", padx=14, pady=(0, 14))
+
+        plan = card("Flight plan")
+        self.plan_label = customtkinter.CTkLabel(plan, text="", text_color=MUTED, font=small, justify="left", anchor="w")
+        self.plan_label.pack(fill="x", padx=14, pady=(4, 6))
+        plan_buttons = customtkinter.CTkFrame(plan, fg_color="transparent")
+        plan_buttons.pack(fill="x", padx=14, pady=(0, 14))
+        plan_buttons.columnconfigure((0, 1, 2, 3), weight=1)
+        self.plan_button = customtkinter.CTkButton(plan_buttons, text="Run", width=56, fg_color=BLUE, hover_color="#4a8fc4", command=self.toggle_plan)
+        self.plan_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        small_outline = dict(fg_color="transparent", border_width=1, border_color="gray40", width=56)
+        for column, (text, command) in enumerate((("Clear", self.clear_plan), ("Save", self.save_plan), ("Load", self.load_plan)), start=1):
+            customtkinter.CTkButton(plan_buttons, text=text, command=command, **small_outline).grid(row=0, column=column, sticky="ew", padx=3)
 
     def run_app(self):
         # Ctrl+C would otherwise be swallowed by Tk callbacks and the app keeps running
@@ -272,6 +304,8 @@ class DroneController:
         self.clear_alert("preflight")
         self.clear_alert("emergency")
         self.clear_alert("home")
+        if not self.plan_active:
+            self.clear_alert("plan")
         self.auto_landed = False
         self.rth_triggered = False
         self.yaw0 = me.get_yaw()
@@ -284,6 +318,7 @@ class DroneController:
         if not self.is_flying:
             return
         self.returning = False
+        self.plan_active = False
         self.run_drone_command(me.land, flying_after=False)
         self.save_flight_log()
 
@@ -291,6 +326,7 @@ class DroneController:
         # cuts the motors at once, the drone falls; no reply to wait for, so no lock
         me.emergency()
         self.returning = False
+        self.plan_active = False
         was_flying, self.is_flying = self.is_flying, False
         self.set_alert("emergency", "EMERGENCY STOP: motors cut", "error")
         if was_flying:
@@ -305,6 +341,7 @@ class DroneController:
     def start_return_home(self, reason):
         if not self.is_flying or self.busy:
             return
+        self.plan_active = False
         self.returning = True
         self.set_alert("home", f"{reason}: ~{self.home_distance() / 100:.1f} m to takeoff point (estimated)", "warn")
 
@@ -316,17 +353,125 @@ class DroneController:
     def home_distance(self):
         return math.hypot(self.home[0] - self.x, self.home[1] - self.y)
 
+    def fly_to_rc(self, target):
+        """rc that turns toward target and flies to it; None once within RTH_ARRIVE."""
+        if math.hypot(target[0] - self.x, target[1] - self.y) < RTH_ARRIVE:
+            return None
+        bearing = math.degrees(math.atan2(target[0] - self.x, target[1] - self.y))  # clockwise from takeoff heading
+        error = wrap_degrees(bearing - (me.get_yaw() - self.yaw0))
+        forward = RTH_SPEED if abs(error) < RTH_ALIGNED else 0
+        return [0, forward, 0, clamp(RTH_HEADING_KP * error, 60)]
+
     def return_home_rc(self):
-        if self.home_distance() < RTH_ARRIVE:
+        rc = self.fly_to_rc(self.home)
+        if rc is None:
             self.returning = False
             self.set_alert("home", "Home reached: landing", "info")
             self.land()
             return [0, 0, 0, 0]
         self.set_alert("home", f"Returning home: ~{self.home_distance() / 100:.1f} m to go (estimated)", "warn")
-        bearing = math.degrees(math.atan2(self.home[0] - self.x, self.home[1] - self.y))  # clockwise from takeoff heading
-        error = wrap_degrees(bearing - (me.get_yaw() - self.yaw0))
-        forward = RTH_SPEED if abs(error) < RTH_ALIGNED else 0
-        return [0, forward, 0, clamp(RTH_HEADING_KP * error, 60)]
+        return rc
+
+    # ---- flight plan --------------------------------------------------------
+
+    def plan_origin(self):
+        # waypoints are relative to the takeoff point: home in flight, the current spot while landed
+        return self.home if self.is_flying else (self.x, self.y)
+
+    def plan_targets(self):
+        ox, oy = self.plan_origin()
+        return [(ox + dx, oy + dy) for dx, dy in self.waypoints]
+
+    def plan_length(self):
+        stops = [(0, 0)] + self.waypoints + [(0, 0)]
+        return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(stops, stops[1:]))
+
+    def update_plan_label(self):
+        if self.waypoints:
+            text = f"{len(self.waypoints)} waypoint(s) · {self.plan_length() / 100:.1f} m round trip (est.)"
+        else:
+            text = "Click the flight map to add waypoints"
+        self.plan_label.configure(text=text)
+
+    def add_waypoint(self, event):
+        if self.map_transform is None:
+            return
+        mid_x, mid_y, scale, w, h = self.map_transform
+        ox, oy = self.plan_origin()
+        x, y = mid_x + (event.x - w / 2) / scale, mid_y - (event.y - h / 2) / scale
+        self.waypoints.append((round(x - ox), round(y - oy)))
+        self.update_plan_label()
+        self.draw_minimap()
+
+    def remove_last_waypoint(self, event=None):
+        if self.waypoints and not (self.plan_active and self.plan_index >= len(self.waypoints) - 1):
+            self.waypoints.pop()
+            self.update_plan_label()
+            self.draw_minimap()
+
+    def clear_plan(self):
+        self.stop_plan("Flight plan cleared")
+        self.waypoints = []
+        self.update_plan_label()
+        self.draw_minimap()
+
+    def toggle_plan(self):
+        if self.plan_active:
+            self.stop_plan("Flight plan stopped: hovering")
+            return
+        if not self.waypoints:
+            self.set_alert("plan", "Add waypoints by clicking the flight map first", "warn")
+            return
+        self.returning = False
+        self.plan_index = 0
+        self.plan_active = True
+        if not self.is_flying:
+            self.takeoff()  # the control loop starts the plan once airborne
+            if not self.busy:  # preflight refused the takeoff
+                self.plan_active = False
+
+    def stop_plan(self, message):
+        if self.plan_active:
+            self.plan_active = False
+            self.set_alert("plan", message, "info")
+
+    def plan_rc(self):
+        targets = self.plan_targets()
+        while self.plan_index < len(targets):
+            target = targets[self.plan_index]
+            rc = self.fly_to_rc(target)
+            if rc is not None:
+                distance = math.hypot(target[0] - self.x, target[1] - self.y)
+                self.set_alert("plan", f"Flight plan: waypoint {self.plan_index + 1} of {len(targets)}, ~{distance / 100:.1f} m to go", "info")
+                return rc
+            self.plan_index += 1
+        self.plan_active = False
+        self.set_alert("plan", "Flight plan complete", "info")
+        self.start_return_home("Flight plan complete")
+        return [0, 0, 0, 0]
+
+    def save_plan(self):
+        if not self.waypoints:
+            return
+        os.makedirs("plans", exist_ok=True)
+        filename = filedialog.asksaveasfilename(parent=self.root, initialdir="plans", defaultextension=".json",
+                                                filetypes=[("Flight plan", "*.json")])
+        if filename:
+            with open(filename, "w") as f:
+                json.dump({"waypoints": self.waypoints}, f)
+
+    def load_plan(self):
+        filename = filedialog.askopenfilename(parent=self.root, initialdir="plans", filetypes=[("Flight plan", "*.json")])
+        if not filename:
+            return
+        try:
+            self.waypoints = parse_plan(filename)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            self.set_alert("plan", f"Could not load plan: {e}", "error")
+            return
+        self.stop_plan("Flight plan loaded")
+        self.update_plan_label()
+        self.draw_minimap()
 
     def run_drone_command(self, command, flying_after):
         # takeoff/land wait for the drone's reply, so keep them off the GUI thread
@@ -362,6 +507,7 @@ class DroneController:
 
     def set_control(self, value):
         self.cancel_return_home("Return home cancelled: control changed")
+        self.stop_plan("Flight plan stopped: control changed")
         self.manual_control_enabled = value == "Manual"
         self.pressed_keys.clear()
         self.auto_rc = [0, 0, 0, 0]
@@ -379,6 +525,7 @@ class DroneController:
         self.pressed_keys.add(key)
         if key in KEY_BINDINGS and self.manual_control_enabled:
             self.cancel_return_home("Return home cancelled: operator took control")
+            self.stop_plan("Flight plan stopped: operator took control")
         if not self.manual_control_enabled:
             return
         if key == "q":
@@ -477,6 +624,8 @@ class DroneController:
         try:
             if self.returning and self.is_flying and not self.busy:
                 rc = self.return_home_rc()
+            elif self.plan_active and self.is_flying and not self.busy:
+                rc = self.plan_rc()
             elif self.manual_control_enabled:
                 rc = self.get_keyboard_input()
             elif self.yolo_enabled:
@@ -554,12 +703,15 @@ class DroneController:
             state, color = ("LANDING", AMBER) if self.is_flying else ("TAKING OFF", AMBER)
         elif self.returning:
             state, color = "RETURNING HOME", AMBER
+        elif self.plan_active and self.is_flying:
+            state, color = f"FLIGHT PLAN {min(self.plan_index + 1, len(self.waypoints))}/{len(self.waypoints)}", BLUE
         else:
             state, color = ("AIRBORNE", GREEN) if self.is_flying else ("LANDED", MUTED)
         self.state_label.configure(text=f"● {state}", text_color=color)
         control = "Manual" if self.manual_control_enabled else "Auto (searching)" if self.searching and self.is_flying else "Auto"
         self.info_label.configure(text=f"{control} · {self.mode_switch.get()}")
         self.home_button.configure(text="Cancel return" if self.returning else "Return home (H)")
+        self.plan_button.configure(text="Stop" if self.plan_active else "Run")
         self.takeoff_land_button.configure(text="Land" if self.is_flying else "Take off",
                                            fg_color=RED if self.is_flying else GREEN,
                                            hover_color=RED_HOVER if self.is_flying else GREEN_HOVER,
@@ -649,17 +801,36 @@ class DroneController:
         w, h = int(c["width"]), int(c["height"])
         path = [(x, y) for x, y, _ in self.points]
         people = [(x, y) for x, y, _ in self.person_points]
-        xs, ys = [p[0] for p in path + people + [self.home]], [p[1] for p in path + people + [self.home]]
-        span = max(200, max(xs) - min(xs), max(ys) - min(ys))  # at least 2 m across
+        origin = self.plan_origin()
+        targets = self.plan_targets()
+        everything = path + people + targets + [self.home, origin]
+        xs, ys = [p[0] for p in everything], [p[1] for p in everything]
+        span = max(MAP_MIN_SPAN, max(xs) - min(xs), max(ys) - min(ys))
         scale = min(w, h) * 0.8 / span
         mid_x, mid_y = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
+        self.map_transform = (mid_x, mid_y, scale, w, h)
 
         def to_canvas(x, y):
             return w / 2 + (x - mid_x) * scale, h / 2 - (y - mid_y) * scale
 
+        # 1 m grid
+        for gx in range(int((mid_x - w / 2 / scale) // 100) * 100, int(mid_x + w / 2 / scale) + 100, 100):
+            c.create_line(to_canvas(gx, 0)[0], 0, to_canvas(gx, 0)[0], h, fill="#242424")
+        for gy in range(int((mid_y - h / 2 / scale) // 100) * 100, int(mid_y + h / 2 / scale) + 100, 100):
+            c.create_line(0, to_canvas(0, gy)[1], w, to_canvas(0, gy)[1], fill="#242424")
+
+        if targets:
+            route = [origin] + targets
+            c.create_line(*[v for p in route for v in to_canvas(*p)], fill=BLUE, width=1, dash=(4, 3))
+            for i, target in enumerate(targets):
+                tx, ty = to_canvas(*target)
+                current = self.plan_active and i == self.plan_index
+                c.create_oval(tx - 7, ty - 7, tx + 7, ty + 7, fill=BLUE if current else "#1a1a1a", outline=BLUE, width=2)
+                c.create_text(tx, ty, text=str(i + 1), fill="white", font=("TkDefaultFont", 7, "bold"))
+
         if len(path) > 1:
             c.create_line(*[v for p in path for v in to_canvas(*p)], fill=GREEN, width=2)
-        hx, hy = to_canvas(*self.home)
+        hx, hy = to_canvas(*(self.home if self.is_flying else origin))
         c.create_rectangle(hx - 7, hy - 7, hx + 7, hy + 7, outline=AMBER, width=2)
         c.create_text(hx, hy, text="H", fill=AMBER, font=("TkDefaultFont", 7, "bold"))
         for x, y in people:
@@ -669,7 +840,8 @@ class DroneController:
         heading = math.radians(me.get_yaw() - self.yaw0)
         c.create_line(px, py, px + 14 * math.sin(heading), py - 14 * math.cos(heading), fill="white", width=2)
         c.create_oval(px - 4, py - 4, px + 4, py + 4, fill="white", outline="")
-        c.create_text(8, 8, anchor="nw", text="FLIGHT MAP", fill="gray50", font=("TkDefaultFont", 8, "bold"))
+        c.create_text(8, 8, anchor="nw", text="FLIGHT MAP · 1 m grid", fill="gray50", font=("TkDefaultFont", 8, "bold"))
+        c.create_text(8, h - 6, anchor="sw", text="click: add waypoint · right-click: undo", fill="gray40", font=("TkDefaultFont", 7))
         if people:
             c.create_text(w - 8, 8, anchor="ne", text=f"◆ {len(people)} sighting(s)", fill=RED, font=("TkDefaultFont", 8))
 
