@@ -1,8 +1,9 @@
-djitellopy==1.5
-opencv-python==4.5.2.52
-numpy==1.19.5
-Pillow==8.2.0
-customtkinter==4.3.2
-torch==1.7.1
-torchvision==0.8.2
-ultralytics==0.0.2
+djitellopy>=2.5
+opencv-python>=4.8
+numpy>=1.24
+Pillow>=10.0
+customtkinter>=5.2
+ultralytics>=8.0
+plotly>=5.0
+cryptography>=41.0
+bcrypt>=4.0

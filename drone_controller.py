@@ -1,301 +1,607 @@
 import os
+import sys
 import time
 import math
+import signal
+import subprocess
+import threading
+import traceback
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 import customtkinter
-from tkinter import Label
-from djitellopy import Tello
+from tkinter import Label, Canvas
 from utilities.yolo_model import YOLOModel
-import utilities.keypressmodule as kp
 import utilities.coord_csv_module as ccsv
 
-me = Tello()
+# GOKBAG_SIM=0 (webcam index) or GOKBAG_SIM=path/to/video runs without a drone
+if os.environ.get("GOKBAG_SIM"):
+    from utilities.fake_tello import FakeTello
+    me = FakeTello(os.environ["GOKBAG_SIM"])
+else:
+    from djitellopy import Tello
+    me = Tello()
+
+GREEN, GREEN_HOVER, RED, RED_HOVER, AMBER, MUTED = "#2fa572", "#258a5e", "#d64545", "#b33838", "#e0a526", "gray60"
+
+# Safety limits
+MIN_TAKEOFF_BATTERY = 20   # % preflight check
+LOW_BATTERY_WARNING = 20   # %
+AUTO_LAND_BATTERY = 10     # % lands by itself (report GCS04)
+MAX_TEMPERATURE = 90       # °C preflight check
+MAX_HEIGHT_CM = 400        # climbing is blocked above this
+LINK_TIMEOUT = 2.0         # s without a telemetry packet = link lost (Tello sends ~10/s)
+
+# Tracking (pixel errors -> rc values, -100..100)
+YAW_KP, YAW_KD, YAW_DEADBAND = 0.4, 0.4, 20
+UD_KP, UD_DEADBAND = 0.3, 30
+FB_KP, TARGET_AREA_MIN, TARGET_AREA_MAX = 0.004, 8000, 25000
+SEARCH_YAW = 20            # turn in place when nobody is visible (report MACS03)
+SAR_CAPTURE_COOLDOWN = 3   # s between automatic search & rescue photos
+
+# Tk keysym -> (axis index in [lr, fb, ud, yv], sign)
+KEY_BINDINGS = {
+    "left": (0, -1), "right": (0, 1),
+    "up": (1, 1), "down": (1, -1),
+    "w": (2, 1), "s": (2, -1),
+    "a": (3, -1), "d": (3, 1),
+}
+ALERT_COLORS = {"error": RED, "warn": AMBER, "info": GREEN}
+
+
+def clamp(value, limit):
+    return int(max(-limit, min(limit, value)))
+
 
 class DroneController:
-    def __init__(self):
+    def __init__(self, root=None):
         me.connect()
         me.streamon()
-        self.root = customtkinter.CTk()
-        self.root.title("Drone Keyboard Controller")
-        self.root.minsize(640, 480)
-
-        self.cap_lbl = Label(self.root)
-        self.cap_lbl.grid(row=0, column=0, columnspan=6)
-
-        self.takeoff_land_button = customtkinter.CTkButton(self.root, text="Takeoff/Land", command=self.toggle_takeoff_land)
-        self.manual_control_button = customtkinter.CTkButton(self.root, text="Manual Control", command=self.toggle_manual_control)
-        self.yolo_button = customtkinter.CTkCheckBox(self.root, text="Object Detection", command=self.toggle_yolo)
-        self.battery_label = customtkinter.CTkLabel(self.root, text="Battery: ")
-        self.height_label = customtkinter.CTkLabel(self.root, text="Height: ")
-        self.capture_button = customtkinter.CTkButton(self.root, text="Capture Image", command=self.capture_image)
-        self.mode_button = customtkinter.CTkButton(self.root, text="Switch Mode", command=self.switch_mode)
-        self.mode_label = customtkinter.CTkLabel(self.root, text="Mode: Operational")
-
-        self.battery_label.grid(row=1, column=0, pady=10)
-        self.height_label.grid(row=1, column=1, pady=10)
-        self.mode_label.grid(row=1, column=2, pady=10)
-
-        self.takeoff_land_button.grid(row=2, column=0, pady=10, padx=5)
-        self.manual_control_button.grid(row=2, column=1, pady=10, padx=5)
-        self.yolo_button.grid(row=2, column=2, pady=10, padx=5)
-        self.capture_button.grid(row=2, column=3, pady=10, padx=5)
-        self.mode_button.grid(row=2, column=4, pady=10, padx=5)
+        self.root = root or customtkinter.CTk()
+        self.root.title("GÖKBAĞ Ground Control")
+        self.root.resizable(False, False)
+        self.build_ui()
 
         self.yolo_enabled = True
         self.is_flying = False
+        self.busy = False  # takeoff/land in progress on a worker thread
+        # djitellopy matches replies to commands by order, so commands that wait for a reply must not overlap
+        self.cmd_lock = threading.Lock()
+        self.running = True
         self.manual_control_enabled = False
         self.current_mode = "operational"
+        self.pressed_keys = set()
+        self.auto_rc = [0, 0, 0, 0]
+        self.searching = False
+        self.prev_err_x = 0
+        self.latest_frame = None
+        self.detected_frame = None
+        self.detections = []
+        self.last_frame = None
+        self.last_sar_capture = 0
+        self.writer = None
+        self.alerts = {}
 
-        self.yolo_button.select()
+        self.link_ok = True
+        self.last_state = None
+        self.last_state_time = time.monotonic()
+        self.signal = None
+        self.auto_landed = False
 
         self.width = 640
         self.height = 480
-        self.deadZone = 100
         self.min_area = 3000
 
-        self.center_x = self.width // 2
-        self.center_y = self.height // 2
-        self.half_deadzone = self.deadZone // 2
-        self.top_left = (self.center_x - self.half_deadzone, self.center_y - self.half_deadzone)
-        self.bottom_right = (self.center_x + self.half_deadzone, self.center_y + self.half_deadzone)
-
-        if not os.path.exists('captured_images'):
-            os.makedirs('captured_images')
+        os.makedirs('captured_images', exist_ok=True)
 
         self.interval = 0.25
+        self.speed = 50
         self.x, self.y, self.z = 500, 500, 0
-        self.yaw = 0
-        self.a = 0
+        self.yaw0 = 0
 
         self.points = [(self.x, self.y, self.z)]
+        self.person_points = []
         self.yolo_model = YOLOModel()
 
+        # Keyboard is read from this window, no separate pygame window needed.
+        self.root.bind("<KeyPress>", self.on_key_press)
+        self.root.bind("<KeyRelease>", self.on_key_release)
+        self.root.protocol("WM_DELETE_WINDOW", self.root.destroy)
+
+    def build_ui(self):
+        heading = customtkinter.CTkFont(size=13, weight="bold")
+        big = customtkinter.CTkFont(size=24, weight="bold")
+        small = customtkinter.CTkFont(size=11)
+
+        # left: flight state bar, alerts, video, mini-map
+        left = customtkinter.CTkFrame(self.root, corner_radius=12)
+        left.grid(row=0, column=0, padx=(16, 8), pady=16, sticky="n")
+        bar = customtkinter.CTkFrame(left, fg_color="transparent")
+        bar.pack(fill="x", padx=14, pady=(10, 6))
+        self.state_label = customtkinter.CTkLabel(bar, text="● LANDED", font=heading, text_color=MUTED)
+        self.state_label.pack(side="left")
+        self.info_label = customtkinter.CTkLabel(bar, text="", text_color=MUTED)
+        self.info_label.pack(side="right")
+        # plain tk Label: a PhotoImage per frame is much cheaper than CTkImage rescaling
+        self.cap_lbl = Label(left, text="Waiting for video…", fg="gray50", bg="#1a1a1a", bd=0, highlightthickness=0, width=80, height=30)
+        self.cap_lbl.pack(padx=14, pady=(0, 10))
+        # overlaid on the video top so alerts appearing/clearing never resize the window
+        self.alert_label = customtkinter.CTkLabel(left, text="", corner_radius=0, text_color="white", font=heading, height=32)
+
+        bottom = customtkinter.CTkFrame(left, fg_color="transparent")
+        bottom.pack(fill="x", padx=14, pady=(0, 14))
+        self.map_canvas = Canvas(bottom, width=330, height=150, bg="#1a1a1a", bd=0, highlightthickness=0)
+        self.map_canvas.pack(side="left")
+        self.keys_label = customtkinter.CTkLabel(bottom, justify="left", text_color=MUTED, font=customtkinter.CTkFont(family="monospace", size=12),
+                                                 text="↑ ↓ ← →  move\nW / S    up / down\nA / D    rotate\nE / Q    take off / land\nSPACE    emergency stop")
+        self.keys_label.pack(side="right", anchor="n")
+
+        side = customtkinter.CTkFrame(self.root, fg_color="transparent", width=280)
+        side.grid(row=0, column=1, padx=(8, 16), pady=16, sticky="ns")
+
+        def card(title):
+            frame = customtkinter.CTkFrame(side, corner_radius=12)
+            frame.pack(fill="x", pady=(0, 12))
+            customtkinter.CTkLabel(frame, text=title.upper(), font=customtkinter.CTkFont(size=11, weight="bold"), text_color=MUTED).pack(anchor="w", padx=14, pady=(10, 0))
+            return frame
+
+        telemetry = card("Telemetry")
+        numbers = customtkinter.CTkFrame(telemetry, fg_color="transparent")
+        numbers.pack(fill="x", padx=14)
+        numbers.columnconfigure((0, 1, 2), weight=1)
+        self.battery_label = customtkinter.CTkLabel(numbers, text="--%", font=big)
+        self.battery_label.grid(row=0, column=0, sticky="w")
+        self.height_label = customtkinter.CTkLabel(numbers, text="-- cm", font=big)
+        self.height_label.grid(row=0, column=1, sticky="w")
+        self.signal_label = customtkinter.CTkLabel(numbers, text="--", font=big)
+        self.signal_label.grid(row=0, column=2, sticky="w")
+        for column, caption in enumerate(("Battery", "Height", "Signal")):
+            customtkinter.CTkLabel(numbers, text=caption, text_color=MUTED).grid(row=1, column=column, sticky="w")
+        self.battery_bar = customtkinter.CTkProgressBar(telemetry, height=8)
+        self.battery_bar.pack(fill="x", padx=14, pady=(6, 14))
+
+        flight = card("Flight")
+        self.takeoff_land_button = customtkinter.CTkButton(flight, text="Take off", height=44, font=heading, fg_color=GREEN, hover_color=GREEN_HOVER, command=self.toggle_takeoff_land)
+        self.takeoff_land_button.pack(fill="x", padx=14, pady=(8, 8))
+        customtkinter.CTkButton(flight, text="Emergency stop (Space)", fg_color="transparent", border_width=1, border_color=RED, text_color=RED,
+                                hover_color="#3a2222", command=self.emergency_stop).pack(fill="x", padx=14, pady=(0, 8))
+        tools = customtkinter.CTkFrame(flight, fg_color="transparent")
+        tools.pack(fill="x", padx=14)
+        tools.columnconfigure((0, 1, 2), weight=1)
+        outline = dict(fg_color="transparent", border_width=1, border_color="gray40", width=70)
+        customtkinter.CTkButton(tools, text="Photo", command=self.capture_image, **outline).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.record_button = customtkinter.CTkButton(tools, text="Record", command=self.toggle_recording, **outline)
+        self.record_button.grid(row=0, column=1, sticky="ew", padx=4)
+        customtkinter.CTkButton(tools, text="3D map", command=self.show_3d_map, **outline).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        self.capture_label = customtkinter.CTkLabel(flight, text="", text_color=MUTED, font=small)
+        self.capture_label.pack(pady=(0, 6))
+
+        control = card("Control")
+        self.control_switch = customtkinter.CTkSegmentedButton(control, values=["Auto", "Manual"], command=self.set_control)
+        self.control_switch.set("Auto")
+        self.control_switch.pack(fill="x", padx=14, pady=(8, 8))
+        self.mode_switch = customtkinter.CTkSegmentedButton(control, values=["Operational", "Search & Rescue"], command=self.set_mode)
+        self.mode_switch.set("Operational")
+        self.mode_switch.pack(fill="x", padx=14, pady=(0, 10))
+        self.yolo_switch = customtkinter.CTkSwitch(control, text="Person detection", command=self.toggle_yolo)
+        self.yolo_switch.select()
+        self.yolo_switch.pack(anchor="w", padx=14, pady=(0, 14))
+
     def run_app(self):
+        # Ctrl+C would otherwise be swallowed by Tk callbacks and the app keeps running
+        signal.signal(signal.SIGINT, lambda *_: self.root.after(0, self.root.destroy))
+        threading.Thread(target=self.detection_worker, daemon=True).start()
+        threading.Thread(target=self.signal_worker, daemon=True).start()
         try:
             self.video_stream()
+            self.control_loop()
             self.root.mainloop()
         except Exception as e:
             print(f"Error running the application: {e}")
         finally:
             self.cleanup()
 
+    # ---- alerts -------------------------------------------------------------
+
+    def set_alert(self, key, text, level="warn"):
+        if self.alerts.get(key) != (level, text):
+            self.alerts[key] = (level, text)
+            self.refresh_alert()
+
+    def clear_alert(self, key):
+        if self.alerts.pop(key, None):
+            self.refresh_alert()
+
+    def refresh_alert(self):
+        if not self.alerts:
+            self.alert_label.place_forget()
+            return
+        level, text = min(self.alerts.values(), key=lambda alert: list(ALERT_COLORS).index(alert[0]))
+        more = f"   (+{len(self.alerts) - 1} more)" if len(self.alerts) > 1 else ""
+        self.alert_label.configure(text=f"{text}{more}", fg_color=ALERT_COLORS[level])
+        self.alert_label.place(in_=self.cap_lbl, relx=0.5, y=0, anchor="n", relwidth=1.0)
+
+    # ---- flight commands ----------------------------------------------------
+
     def toggle_yolo(self):
         self.yolo_enabled = not self.yolo_enabled
+        self.auto_rc = [0, 0, 0, 0]
+        self.detections = []
 
     def toggle_takeoff_land(self):
         if self.is_flying:
-            self.is_flying = False
-            me.land()
+            self.land()
+        else:
+            self.takeoff()
+
+    def preflight_problems(self):
+        problems = []
+        if not self.link_ok:
+            problems.append("no telemetry from drone")
+        if me.get_battery() < MIN_TAKEOFF_BATTERY:
+            problems.append(f"battery below {MIN_TAKEOFF_BATTERY}%")
+        if me.get_temperature() > MAX_TEMPERATURE:
+            problems.append(f"drone hotter than {MAX_TEMPERATURE}°C")
+        return problems
+
+    def takeoff(self):
+        if self.is_flying or self.busy:
+            return
+        problems = self.preflight_problems()
+        if problems:
+            self.set_alert("preflight", "Preflight check failed: " + ", ".join(problems), "error")
+            return
+        self.clear_alert("preflight")
+        self.clear_alert("emergency")
+        self.auto_landed = False
+        self.yaw0 = me.get_yaw()
+        self.points = [(self.x, self.y, self.z)]
+        self.person_points = []
+        self.run_drone_command(me.takeoff, flying_after=True)
+
+    def land(self):
+        if not self.is_flying:
+            return
+        self.run_drone_command(me.land, flying_after=False)
+        self.save_flight_log()
+
+    def emergency_stop(self):
+        # cuts the motors at once, the drone falls; no reply to wait for, so no lock
+        me.emergency()
+        was_flying, self.is_flying = self.is_flying, False
+        self.set_alert("emergency", "EMERGENCY STOP: motors cut", "error")
+        if was_flying:
             self.save_flight_log()
-        else:
-            self.is_flying = True
-            me.takeoff()
-            self.points = [(self.x, self.y, self.z)]
 
-    def toggle_manual_control(self):
-        self.manual_control_enabled = not self.manual_control_enabled
-        if self.manual_control_enabled:
-            kp.init()
+    def run_drone_command(self, command, flying_after):
+        # takeoff/land wait for the drone's reply, so keep them off the GUI thread
+        if self.busy:
+            return
+        self.busy = True
 
-    def switch_mode(self):
-        if self.current_mode == "operational":
-            self.current_mode = "search_and_rescue"
-            self.mode_label.configure(text="Mode: Search and Rescue")
-        else:
-            self.current_mode = "operational"
-            self.mode_label.configure(text="Mode: Operational")
+        def worker():
+            try:
+                with self.cmd_lock:
+                    command()
+                self.is_flying = flying_after
+            except Exception as e:
+                print(f"{command.__name__} failed: {e}")
+            finally:
+                self.busy = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def signal_worker(self):
+        while self.running:
+            # skip when a takeoff/land holds the lock; never queue behind it
+            if self.link_ok and self.cmd_lock.acquire(blocking=False):
+                try:
+                    self.signal = int(me.query_wifi_signal_noise_ratio())
+                except Exception:
+                    self.signal = None
+                finally:
+                    self.cmd_lock.release()
+            time.sleep(5)
+
+    # ---- input --------------------------------------------------------------
+
+    def set_control(self, value):
+        self.manual_control_enabled = value == "Manual"
+        self.pressed_keys.clear()
+        self.auto_rc = [0, 0, 0, 0]
+        self.keys_label.configure(text_color="gray90" if self.manual_control_enabled else MUTED)
+        self.root.focus_set()
+
+    def on_key_press(self, event):
+        key = event.keysym.lower()
+        if key == "space":
+            self.emergency_stop()
+            return
+        self.pressed_keys.add(key)
+        if not self.manual_control_enabled:
+            return
+        if key == "q":
+            self.land()
+        elif key == "e":
+            self.takeoff()
+
+    def on_key_release(self, event):
+        self.pressed_keys.discard(event.keysym.lower())
+
+    def set_mode(self, value):
+        self.current_mode = "search_and_rescue" if value == "Search & Rescue" else "operational"
+
+    def get_keyboard_input(self):
+        rc = [0, 0, 0, 0]
+        for key in self.pressed_keys:
+            if key in KEY_BINDINGS:
+                axis, sign = KEY_BINDINGS[key]
+                rc[axis] = sign * self.speed
+        return rc
+
+    # ---- media --------------------------------------------------------------
+
+    def save_frame(self, prefix):
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        filename = f'captured_images/{prefix}_{timestamp}.jpg'
+        Image.fromarray(self.last_frame).save(filename)
+        self.capture_label.configure(text=f"Saved {os.path.basename(filename)}")
+        return filename
 
     def capture_image(self):
-        frame = me.get_frame_read().frame
-        if self.yolo_enabled:
-            frame, _ = self.process_frame(frame)
-        img_pil = Image.fromarray(frame)
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        filename = f'captured_images/capture_{timestamp}.jpg'
-        img_pil.save(filename)
-        print(f"Image saved as {filename}")
+        if self.last_frame is not None:
+            print(f"Image saved as {self.save_frame('capture')}")
+
+    def toggle_recording(self):
+        if self.writer is None:
+            os.makedirs('recordings', exist_ok=True)
+            filename = f"recordings/flight_{time.strftime('%Y%m%d-%H%M%S')}.mp4"
+            # shortcut: fixed 15 fps tag while real frame rate varies with YOLO load, playback speed is approximate
+            self.writer = cv2.VideoWriter(filename, cv2.VideoWriter_fourcc(*"mp4v"), 15, (self.width, self.height))
+            self.record_button.configure(text="■ Stop", text_color=RED)
+            self.capture_label.configure(text=f"Recording {os.path.basename(filename)}")
+        else:
+            self.writer.release()
+            self.writer = None
+            self.record_button.configure(text="Record", text_color=("gray10", "gray90"))
+            self.capture_label.configure(text="Recording saved")
+
+    def show_3d_map(self):
+        # plotly opens in the browser; a separate process keeps the GUI responsive
+        subprocess.Popen([sys.executable, "show_map_3d.py"])
+
+    # ---- loops --------------------------------------------------------------
 
     def video_stream(self):
-        start_time = time.time()
-        frame = me.get_frame_read().frame
-        if self.yolo_enabled:
-            frame = cv2.resize(frame, (640, 480))
-            frame, detected_objects = self.process_frame(frame)
-        
-        self.update_battery_and_height()
-        img = Image.fromarray(frame)
-        imgtk = ImageTk.PhotoImage(image=img)
-        self.cap_lbl.grid(row=0, column=0, columnspan=6)
-        self.cap_lbl.imgtk = imgtk
-        self.cap_lbl.configure(image=imgtk)
-        self.cap_lbl.after(5, self.video_stream)
+        try:
+            self.update_status()
+            frame = cv2.resize(me.get_frame_read().frame, (self.width, self.height))
+            self.latest_frame = frame  # handed to the detection thread untouched
+            display = frame.copy()
+            if self.yolo_enabled:
+                self.draw_detections(display, self.detections)
+            self.last_frame = display
+            if self.writer is not None:
+                self.writer.write(cv2.cvtColor(display, cv2.COLOR_RGB2BGR))
+            self.search_and_rescue_capture()
 
-        if self.manual_control_enabled:
-            self.manual_control()
+            imgtk = ImageTk.PhotoImage(image=Image.fromarray(display))
+            self.cap_lbl.imgtk = imgtk
+            # width/height switch from characters (placeholder text) to pixels once an image is set
+            self.cap_lbl.configure(image=imgtk, width=self.width, height=self.height)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            # always reschedule, otherwise one bad frame freezes the video for good.
+            # after_idle first: a frame slower than 5ms would keep a timer always due and Tk never redraws
+            self.root.after_idle(self.root.after, 5, self.video_stream)
 
-        end_time = time.time()
-        print(f"Frame processed in {end_time - start_time:.2f} seconds")
+    def detection_worker(self):
+        # YOLO runs here so slow inference never stalls the video or the controls
+        while self.running:
+            frame = self.latest_frame
+            if not self.yolo_enabled or frame is None or frame is self.detected_frame:
+                time.sleep(0.01)
+                continue
+            self.detected_frame = frame
+            try:
+                detections = self.detect(frame)
+                if self.yolo_enabled:
+                    self.detections = detections
+                    self.auto_rc = self.compute_auto_rc(detections)
+            except Exception:
+                traceback.print_exc()
+
+    def control_loop(self):
+        try:
+            if self.manual_control_enabled:
+                rc = self.get_keyboard_input()
+            elif self.yolo_enabled:
+                rc = list(self.auto_rc)
+            else:
+                rc = [0, 0, 0, 0]
+
+            if self.is_flying and not self.busy:
+                if rc[2] > 0 and me.get_height() >= MAX_HEIGHT_CM:
+                    rc[2] = 0
+                    self.set_alert("ceiling", f"Height limit {MAX_HEIGHT_CM} cm reached", "warn")
+                else:
+                    self.clear_alert("ceiling")
+                me.send_rc_control(*rc)
+                self.log_flight_path(*rc)
+            self.draw_minimap()
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self.root.after(int(self.interval * 1000), self.control_loop)
 
     def cleanup(self):
+        self.running = False
         try:
             print("Cleaning up resources...")
-            me.streamoff()
-            self.root.quit()
-            exit()
+            if self.writer is not None:
+                self.writer.release()
+            if self.is_flying:
+                self.save_flight_log()
+            me.end()  # lands first if still flying, then stops the stream
         except Exception as e:
             print(f"Error performing cleanup: {e}")
 
-    def update_battery_and_height(self):
+    # ---- status & safety ----------------------------------------------------
+
+    def check_link(self):
+        # djitellopy stores a new state dict for every telemetry packet
+        state = me.get_current_state()
+        now = time.monotonic()
+        if state is not self.last_state:
+            self.last_state, self.last_state_time = state, now
+        self.link_ok = now - self.last_state_time < LINK_TIMEOUT
+        if self.link_ok:
+            self.clear_alert("link")
+        else:
+            self.set_alert("link", "LINK LOST: no telemetry. Tello lands by itself after 15 s without commands", "error")
+
+    def check_battery(self, battery):
+        if self.is_flying and not self.busy and battery <= AUTO_LAND_BATTERY and not self.auto_landed:
+            self.auto_landed = True
+            self.set_alert("battery", f"Battery {battery}%: landing automatically", "error")
+            self.land()
+        elif battery <= LOW_BATTERY_WARNING:
+            self.set_alert("battery", f"Low battery {battery}%: land soon", "warn")
+        else:
+            self.clear_alert("battery")
+
+    def update_status(self):
+        self.check_link()
         battery = me.get_battery()
-        height = me.get_height()
-        self.battery_label.configure(text=f"Battery: {battery}%")
-        self.height_label.configure(text=f"Height: {height} cm")
+        self.check_battery(battery)
+        self.battery_label.configure(text=f"{battery}%")
+        self.battery_bar.set(battery / 100)
+        self.battery_bar.configure(progress_color=GREEN if battery > 50 else AMBER if battery > 20 else RED)
+        self.height_label.configure(text=f"{me.get_height()} cm")
+        self.signal_label.configure(text="--" if self.signal is None else str(self.signal))
 
-    def process_frame(self, img):
-        results = self.yolo_model.predict(img)
-        centers = []
-        areas = []
-        for result in results:
+        if not self.link_ok:
+            state, color = "LINK LOST", RED
+        elif self.busy:
+            state, color = ("LANDING", AMBER) if self.is_flying else ("TAKING OFF", AMBER)
+        else:
+            state, color = ("AIRBORNE", GREEN) if self.is_flying else ("LANDED", MUTED)
+        self.state_label.configure(text=f"● {state}", text_color=color)
+        control = "Manual" if self.manual_control_enabled else "Auto (searching)" if self.searching and self.is_flying else "Auto"
+        self.info_label.configure(text=f"{control} · {self.mode_switch.get()}")
+        self.takeoff_land_button.configure(text="Land" if self.is_flying else "Take off",
+                                           fg_color=RED if self.is_flying else GREEN,
+                                           hover_color=RED_HOVER if self.is_flying else GREEN_HOVER,
+                                           state="disabled" if self.busy else "normal")
+
+    # ---- detection & tracking ----------------------------------------------
+
+    def detect(self, img):
+        detections = []
+        for result in self.yolo_model.predict(img):
             for box in result.boxes:
-                if result.names[int(box.cls[0])] == "person":
-                    x1, y1, x2, y2 = int(box.xyxy[0][0]), int(box.xyxy[0][1]), int(box.xyxy[0][2]), int(box.xyxy[0][3])
-                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                    area = (x2 - x1) * (y2 - y1)
-                    if area >= self.min_area:
-                        centers.append([cx, cy])
-                        areas.append(area)
-                        if self.current_mode == "search_and_rescue":
-                            cv2.putText(img, "Person Detected", (x1, y1 - 15), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                        else:
-                            cv2.putText(img, "Ally Detected", (x1, y1 - 15), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    else:
-                        if self.current_mode == "search_and_rescue":
-                            cv2.putText(img, "Person Detected", (x1, y1 - 15), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                        else:
-                            cv2.putText(img, "Hostile Detected", (x1, y1 - 15), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-                            cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                if result.names[int(box.cls[0])] != "person":
+                    continue
+                x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
+                detections.append((x1, y1, x2, y2))
+        return detections
+
+    def draw_detections(self, img, detections):
+        centers = []
+        for x1, y1, x2, y2 in detections:
+            area = (x2 - x1) * (y2 - y1)
+            if area >= self.min_area:
+                centers.append([(x1 + x2) // 2, (y1 + y2) // 2])
+            if self.current_mode == "search_and_rescue":
+                text, color = "Person Detected", (0, 0, 255)
+            elif area >= self.min_area:
+                text, color = "Ally Detected", (0, 255, 0)
+            else:
+                text, color = "Hostile Detected", (255, 0, 0)
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(img, text, (x1, max(15, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         if centers:
-            centers_np = np.array(centers)
-            group_center = centers_np.mean(axis=0).astype(int)
-            cv2.circle(img, tuple(group_center), 10, (255, 0, 255), -1)
-            cv2.putText(img, "Group Center", (group_center[0], group_center[1] - 15), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 2)
+            gx, gy = (int(v) for v in np.mean(centers, axis=0))
+            cv2.circle(img, (gx, gy), 8, (255, 0, 255), -1)
+            cv2.putText(img, "Group Center", (gx + 12, gy + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
-        if not self.manual_control_enabled:
-            self.control_drone(centers, areas)
+    def compute_auto_rc(self, detections):
+        targets = [(x1, y1, x2, y2) for x1, y1, x2, y2 in detections if (x2 - x1) * (y2 - y1) >= self.min_area]
+        self.searching = not targets
+        if not targets:
+            self.prev_err_x = 0
+            return [0, 0, 0, SEARCH_YAW]
 
-        return img, results
+        cx = np.mean([(x1 + x2) / 2 for x1, _, x2, _ in targets])
+        cy = np.mean([(y1 + y2) / 2 for _, y1, _, y2 in targets])
+        area = np.mean([(x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in targets])
 
-    def control_drone(self, centers, areas):
-        direction, group_center = self.calculate_direction(centers, self.width, self.height, self.deadZone)
-        distance_adjustment = self.calculate_distance_adjustment(areas)
+        # PD on yaw keeps the group centred without the old fixed-speed wobble
+        err_x = cx - self.width / 2
+        yaw = 0 if abs(err_x) < YAW_DEADBAND else clamp(YAW_KP * err_x + YAW_KD * (err_x - self.prev_err_x), 60)
+        self.prev_err_x = err_x
 
-        me.left_right_velocity = 0
-        me.for_back_velocity = 0
-        me.up_down_velocity = 0
-        me.yaw_velocity = 0
+        err_y = self.height / 2 - cy  # positive: target above centre -> climb
+        up_down = 0 if abs(err_y) < UD_DEADBAND else clamp(UD_KP * err_y, 40)
 
-        if direction == 1:
-            me.yaw_velocity = -13
-        elif direction == 2:
-            me.yaw_velocity = 13
-        if direction == 3:
-            me.up_down_velocity = 20
-        elif direction == 4:
-            me.up_down_velocity = -20
+        if TARGET_AREA_MIN <= area <= TARGET_AREA_MAX:
+            forward = 0
+        else:
+            forward = clamp(FB_KP * ((TARGET_AREA_MIN + TARGET_AREA_MAX) / 2 - area), 30)
+        return [0, forward, up_down, yaw]
 
-        me.for_back_velocity = distance_adjustment
+    # ---- search & rescue, map, flight log ------------------------------------
 
-        if me.send_rc_control:
-            print(me.left_right_velocity, me.for_back_velocity, me.up_down_velocity, me.yaw_velocity, time.time())
-            me.send_rc_control(me.left_right_velocity, me.for_back_velocity, me.up_down_velocity, me.yaw_velocity)
-
-        self.log_flight_path(me.left_right_velocity, me.for_back_velocity, me.up_down_velocity, me.yaw_velocity)
-
-    def calculate_direction(self, centers, frameWidth, frameHeight, deadZone):
-        dir = 0
-        group_center = None
-        if centers:
-            group_center = np.mean(np.array(centers), axis=0).astype(int)
-            cx, cy = group_center
-            if (cx < int(frameWidth / 2) - deadZone):
-                dir = 1
-            elif (cx > int(frameWidth / 2) + deadZone):
-                dir = 2
-            elif (cy < int(frameHeight / 2) - deadZone):
-                dir = 3
-            elif (cy > int(frameHeight / 2) + deadZone):
-                dir = 4 
-        return dir, group_center
-
-    def calculate_distance_adjustment(self, areas):
-        distance_adjustment = 0
-        if areas:
-            avg_area = np.mean(areas)
-            if avg_area < 8000:
-                distance_adjustment = 30
-            elif avg_area > 25000:
-                distance_adjustment = -30
-        return distance_adjustment
-
-    def manual_control(self):
-        lr, fb, ud, yv = self.get_keyboard_input()
-        me.send_rc_control(lr, fb, ud, yv)
-        self.log_flight_path(lr, fb, ud, yv)
-
-    def get_keyboard_input(self):
-        lr, fb, ud, yv = 0, 0, 0, 0
-        speed = 50
-        aspeed = 50
-
-        if kp.getKey("LEFT"):
-            lr = -speed
-        elif kp.getKey("RIGHT"):
-            lr = speed
-        if kp.getKey("UP"):
-            fb = speed
-        elif kp.getKey("DOWN"):
-            fb = -speed
-        if kp.getKey("w"):
-            ud = speed
-        elif kp.getKey("s"):
-            ud = -speed
-        if kp.getKey("a"):
-            yv = -aspeed
-        elif kp.getKey("d"):
-            yv = aspeed
-        if kp.getKey("q"): 
-            me.land()
-            self.save_flight_log()
-            time.sleep(3)
-        if kp.getKey("e"): 
-            me.takeoff()
-
-        time.sleep(self.interval)
-
-        return [lr, fb, ud, yv]
+    def search_and_rescue_capture(self):
+        if self.current_mode != "search_and_rescue" or not self.is_flying or not self.detections:
+            return
+        if time.monotonic() - self.last_sar_capture < SAR_CAPTURE_COOLDOWN:
+            return
+        self.last_sar_capture = time.monotonic()
+        self.save_frame("sar")
+        self.person_points.append((self.x, self.y, self.z))
 
     def log_flight_path(self, lr, fb, ud, yv):
         if lr != 0 or fb != 0 or ud != 0 or yv != 0:
-            distance = math.sqrt((lr ** 2) + (fb ** 2))
-            angle = math.atan2(fb, lr)
-
-            self.x += distance * math.cos(angle + math.radians(self.yaw))
-            self.y += distance * math.sin(angle + math.radians(self.yaw))
-            self.z += ud * self.interval
-
-            self.yaw += yv * self.interval
+            # heading and height from telemetry; horizontal speed estimated from the commands (rc treated as cm/s)
+            heading = math.radians(me.get_yaw() - self.yaw0)  # Tello yaw is clockwise-positive
+            self.x += (lr * math.cos(heading) + fb * math.sin(heading)) * self.interval
+            self.y += (fb * math.cos(heading) - lr * math.sin(heading)) * self.interval
+            self.z = me.get_height()
 
             self.points.append((self.x, self.y, self.z))
+
+    def draw_minimap(self):
+        c = self.map_canvas
+        c.delete("all")
+        w, h = int(c["width"]), int(c["height"])
+        path = [(x, y) for x, y, _ in self.points]
+        people = [(x, y) for x, y, _ in self.person_points]
+        xs, ys = [p[0] for p in path + people], [p[1] for p in path + people]
+        span = max(200, max(xs) - min(xs), max(ys) - min(ys))  # at least 2 m across
+        scale = min(w, h) * 0.8 / span
+        mid_x, mid_y = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
+
+        def to_canvas(x, y):
+            return w / 2 + (x - mid_x) * scale, h / 2 - (y - mid_y) * scale
+
+        if len(path) > 1:
+            c.create_line(*[v for p in path for v in to_canvas(*p)], fill=GREEN, width=2)
+        for x, y in people:
+            px, py = to_canvas(x, y)
+            c.create_polygon(px, py - 6, px + 6, py, px, py + 6, px - 6, py, fill=RED)
+        px, py = to_canvas(self.x, self.y)
+        heading = math.radians(me.get_yaw() - self.yaw0)
+        c.create_line(px, py, px + 14 * math.sin(heading), py - 14 * math.cos(heading), fill="white", width=2)
+        c.create_oval(px - 4, py - 4, px + 4, py + 4, fill="white", outline="")
+        c.create_text(8, 8, anchor="nw", text="FLIGHT MAP", fill="gray50", font=("TkDefaultFont", 8, "bold"))
+        if people:
+            c.create_text(w - 8, 8, anchor="ne", text=f"◆ {len(people)} sighting(s)", fill=RED, font=("TkDefaultFont", 8))
 
     def save_flight_log(self):
         if self.points:
             self.points.pop(0)
-        ccsv.make_csv(self.points)
+        ccsv.make_csv(self.points, detections=self.person_points)
         self.points = [(self.x, self.y, self.z)]
-

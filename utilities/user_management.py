@@ -1,33 +1,45 @@
 import os
-import random
+import hmac
+import secrets
 import string
 import hashlib
 import json
+import bcrypt
+
 
 def generate_password(length=12):
     characters = string.ascii_letters + string.digits + string.punctuation
-    return ''.join(random.choice(characters) for i in range(length))
+    return ''.join(secrets.choice(characters) for _ in range(length))
 
-def generate_salt(length=16):
-    return os.urandom(length)
 
-def hash_password(password, salt):
-    return hashlib.sha256(salt + password.encode()).hexdigest()
+def hash_password(password):
+    # bcrypt keeps its salt inside the hash and is deliberately slow against brute force
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
+def verify_password(password, record):
+    if 'salt' in record:  # legacy salted SHA-256 record, upgraded on next successful login
+        legacy = hashlib.sha256(bytes.fromhex(record['salt']) + password.encode()).hexdigest()
+        return hmac.compare_digest(legacy, record['password'])
+    return bcrypt.checkpw(password.encode(), record['password'].encode())
+
+
+def needs_rehash(record):
+    return 'salt' in record
+
+
+def make_record(password):
+    return {'password': hash_password(password)}
+
 
 def update_user_data(users, user_data_file):
     with open(user_data_file, 'w') as f:
         json.dump(users, f)
 
+
 def load_users(user_data_file):
     if not os.path.exists(user_data_file):
-        users = {
-            'user1': {'password': hash_password('user1pass', (salt := generate_salt())), 'salt': salt.hex()},
-            'user2': {'password': hash_password('user2pass', (salt := generate_salt())), 'salt': salt.hex()},
-            'user3': {'password': hash_password('user3pass', (salt := generate_salt())), 'salt': salt.hex()},
-            'user4': {'password': hash_password('user4pass', (salt := generate_salt())), 'salt': salt.hex()},
-            'user5': {'password': hash_password('user5pass', (salt := generate_salt())), 'salt': salt.hex()},
-            'admin': {'password': hash_password('adminpass', (salt := generate_salt())), 'salt': salt.hex()}
-        }
+        users = {name: make_record(f'{name}pass') for name in ('user1', 'user2', 'user3', 'user4', 'user5', 'admin')}
         update_user_data(users, user_data_file)
     else:
         with open(user_data_file, 'r') as f:
@@ -35,9 +47,7 @@ def load_users(user_data_file):
 
         for username, user_data in users.items():
             if isinstance(user_data, str):
-                salt = generate_salt()
-                hashed_password = hash_password(user_data, salt)
-                users[username] = {'password': hashed_password, 'salt': salt.hex()}
-                update_user_data(users, user_data_file)
+                users[username] = make_record(user_data)
+        update_user_data(users, user_data_file)
 
     return users
