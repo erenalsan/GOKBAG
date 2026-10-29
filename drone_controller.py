@@ -569,18 +569,22 @@ class DroneController:
             if area >= self.min_area:
                 centers.append([(x1 + x2) // 2, (y1 + y2) // 2])
             if self.current_mode == "search_and_rescue":
-                text, color = "Person Detected", (0, 0, 255)
+                text, color = "Person Detected", (77, 141, 255)
             elif area >= self.min_area:
-                text, color = "Ally Detected", (0, 255, 0)
+                text, color = "Ally Detected", (76, 200, 120)
             else:
-                text, color = "Hostile Detected", (255, 0, 0)
+                text, color = "Hostile Detected", (217, 72, 72)
             cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(img, text, (x1, max(15, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            # small label on a solid tag: readable on any background without shouting
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            ty = max(th + 6, y1)
+            cv2.rectangle(img, (x1, ty - th - 6), (x1 + tw + 8, ty), color, -1)
+            ink = (17, 18, 20) if text == "Ally Detected" else (255, 255, 255)  # dark text where white would wash out
+            cv2.putText(img, text, (x1 + 4, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ink, 1, cv2.LINE_AA)
 
         if centers:
             gx, gy = (int(v) for v in np.mean(centers, axis=0))
-            cv2.circle(img, (gx, gy), 8, (255, 0, 255), -1)
-            cv2.putText(img, "Group Center", (gx + 12, gy + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+            cv2.drawMarker(img, (gx, gy), (255, 255, 255), cv2.MARKER_CROSS, 18, 2, cv2.LINE_AA)
 
     def compute_auto_rc(self, detections):
         targets = [(x1, y1, x2, y2) for x1, y1, x2, y2 in detections if (x2 - x1) * (y2 - y1) >= self.min_area]

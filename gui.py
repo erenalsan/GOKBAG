@@ -8,50 +8,49 @@ from PySide6.QtWidgets import (QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxL
                                QFileDialog, QSizePolicy, QButtonGroup)
 import drone_controller as dc
 
-BG, CARD, CARD2, BORDER = "#0f1216", "#171b21", "#1f252d", "#2a323d"
-TEXT, MUTED = "#e8edf2", "#8b96a3"
-GREEN, RED, AMBER, BLUE, INDIGO = "#22c55e", "#ef4444", "#f59e0b", "#3b82f6", "#6366f1"
-LEVEL_COLORS = {"error": RED, "warn": AMBER, "info": GREEN}
+# Neutral greys, one accent; colour only where it carries meaning (state, danger)
+BG, SURFACE, RAISED, BORDER = "#111214", "#18191c", "#202226", "#2c2f34"
+TEXT, MUTED, FAINT = "#e4e5e7", "#8b8f96", "#5c6067"
+ACCENT, RED, AMBER, GREEN = "#4d8dff", "#d94848", "#d99a2b", "#4caf72"
+LEVEL_COLORS = {"error": RED, "warn": AMBER, "info": ACCENT}
+STATE_COLORS = {"idle": FAINT, "ok": GREEN, "plan": ACCENT, "warn": AMBER, "error": RED}
 
 STYLE = f"""
-QWidget {{ background: {BG}; color: {TEXT}; font-family: "Ubuntu", "Cantarell", "Noto Sans", sans-serif; font-size: 15px; }}
-QFrame#Card {{ background: {CARD}; border-radius: 18px; }}
+QWidget {{ background: {BG}; color: {TEXT}; font-family: "Ubuntu", "Cantarell", "Noto Sans", sans-serif; font-size: 14px; }}
 QLabel {{ background: transparent; }}
-QLabel#Title {{ font-size: 22px; font-weight: 800; letter-spacing: 2px; }}
+QFrame#Panel {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 10px; }}
+QLabel#Title {{ font-size: 15px; font-weight: 700; letter-spacing: 3px; color: {TEXT}; }}
+QLabel#State {{ font-size: 15px; font-weight: 600; }}
+QLabel#Caption {{ color: {MUTED}; font-size: 11px; font-weight: 600; letter-spacing: 1px; }}
+QLabel#Value {{ font-size: 19px; font-weight: 600; }}
 QLabel#Muted {{ color: {MUTED}; font-size: 13px; }}
-QLabel#Section {{ color: {MUTED}; font-size: 12px; font-weight: 700; letter-spacing: 1px; }}
-QLabel#Chip {{ background: {CARD2}; border-radius: 14px; padding: 8px 16px; font-size: 18px; font-weight: 700; }}
-QLabel#Pill {{ border-radius: 16px; padding: 8px 18px; font-size: 16px; font-weight: 700; }}
-QLabel#Pill[level="idle"]  {{ background: #1f252d; color: {MUTED}; }}
-QLabel#Pill[level="ok"]    {{ background: #123d26; color: #86efac; }}
-QLabel#Pill[level="plan"]  {{ background: #172a4d; color: #93c5fd; }}
-QLabel#Pill[level="warn"]  {{ background: #3d2c0c; color: #fcd34d; }}
-QLabel#Pill[level="error"] {{ background: #4a1515; color: #fca5a5; }}
-QLabel#Video {{ background: #000; border-radius: 14px; color: {MUTED}; font-size: 18px; }}
-QLabel#Banner {{ border-radius: 12px; padding: 10px 16px; font-size: 17px; font-weight: 700; color: white; }}
-QPushButton {{ background: {CARD2}; border: 1px solid {BORDER}; border-radius: 12px; padding: 10px 14px; font-weight: 600; }}
-QPushButton:hover {{ background: #27303a; }}
-QPushButton:pressed {{ background: #2f3946; }}
-QPushButton:checked {{ background: {BLUE}; border-color: {BLUE}; color: white; }}
-QPushButton:disabled {{ color: #556070; }}
-QPushButton#Big {{ font-size: 21px; font-weight: 800; border-radius: 20px; min-height: 84px; padding: 0 22px; border: none; color: white; }}
-QPushButton#Big[tone="green"]  {{ background: #16a34a; }}  QPushButton#Big[tone="green"]:hover  {{ background: #15803d; }}
-QPushButton#Big[tone="indigo"] {{ background: {INDIGO}; }} QPushButton#Big[tone="indigo"]:hover {{ background: #4f46e5; }}
-QPushButton#Big[tone="amber"]  {{ background: #d97706; }}  QPushButton#Big[tone="amber"]:hover  {{ background: #b45309; }}
-QPushButton#Big[tone="grey"]   {{ background: {CARD2}; border: 2px solid {BORDER}; }}
-QPushButton#Big[tone="grey"]:hover {{ background: #27303a; }}
-QPushButton#Big[tone="blue"]   {{ background: {BLUE}; }}   QPushButton#Big[tone="blue"]:hover   {{ background: #2563eb; }}
-QPushButton#Big[tone="red"]    {{ background: #dc2626; }}  QPushButton#Big[tone="red"]:hover    {{ background: #b91c1c; }}
-QPushButton#Big:disabled {{ background: #2a2f36; color: #6b7480; }}
-QPushButton#Danger {{ background: transparent; border: 2px solid {RED}; color: #fca5a5; }}
-QPushButton#Danger:hover {{ background: #3a1414; }}
-QCheckBox {{ spacing: 10px; font-size: 15px; background: transparent; }}
-QCheckBox::indicator {{ width: 22px; height: 22px; border-radius: 6px; border: 2px solid {BORDER}; background: {CARD2}; }}
-QCheckBox::indicator:checked {{ background: {BLUE}; border-color: {BLUE}; }}
-QLineEdit {{ background: {CARD2}; border: 1px solid {BORDER}; border-radius: 12px; padding: 12px 14px; font-size: 16px; }}
-QLineEdit:focus {{ border-color: {BLUE}; }}
-QComboBox {{ background: {CARD2}; border: 1px solid {BORDER}; border-radius: 12px; padding: 10px 14px; font-size: 16px; }}
-QToolTip {{ background: {CARD2}; color: {TEXT}; border: 1px solid {BORDER}; padding: 6px; }}
+QLabel#Video {{ background: #000; border-radius: 8px; color: {MUTED}; font-size: 15px; }}
+QLabel#Banner {{ background: rgba(17, 18, 20, 230); border-radius: 6px; padding: 10px 14px; font-size: 15px; font-weight: 600; }}
+QFrame#Divider {{ background: {BORDER}; max-width: 1px; }}
+QPushButton {{ background: {RAISED}; border: 1px solid {BORDER}; border-radius: 8px; padding: 8px 14px; font-weight: 500; }}
+QPushButton:hover {{ background: #272a2f; border-color: #3a3e45; }}
+QPushButton:pressed {{ background: #2d3036; }}
+QPushButton:checked {{ border-color: {ACCENT}; color: {ACCENT}; }}
+QPushButton:disabled {{ color: {FAINT}; border-color: #24262a; background: #1a1b1e; }}
+QPushButton#Flat {{ background: transparent; border: none; color: {MUTED}; padding: 6px 10px; }}
+QPushButton#Flat:hover {{ color: {TEXT}; }}
+QPushButton#Flat:checked {{ color: {TEXT}; }}
+QPushButton#Big {{ font-size: 17px; font-weight: 600; min-height: 60px; padding: 0 20px; }}
+QPushButton#Big[tone="primary"] {{ background: {ACCENT}; border: none; color: white; }}
+QPushButton#Big[tone="primary"]:hover {{ background: #3f7ce8; }}
+QPushButton#Big[tone="active"] {{ border: 1px solid {ACCENT}; color: {ACCENT}; background: #1b2232; }}
+QPushButton#Big[tone="stop"] {{ background: {RED}; border: none; color: white; }}
+QPushButton#Big[tone="stop"]:hover {{ background: #c43d3d; }}
+QPushButton#Big[tone="stop"]:disabled {{ background: #1a1b1e; border: 1px solid #24262a; color: {FAINT}; }}
+QPushButton#Danger {{ background: transparent; border: 1px solid #5a2a2a; color: #e07a7a; }}
+QPushButton#Danger:hover {{ background: #241616; border-color: {RED}; }}
+QCheckBox {{ spacing: 8px; background: transparent; }}
+QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; border: 1px solid #45494f; background: {RAISED}; }}
+QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
+QLineEdit {{ background: {RAISED}; border: 1px solid {BORDER}; border-radius: 8px; padding: 10px 12px; font-size: 15px; }}
+QLineEdit:focus {{ border-color: {ACCENT}; }}
+QComboBox {{ background: {RAISED}; border: 1px solid {BORDER}; border-radius: 8px; padding: 8px 12px; }}
+QToolTip {{ background: {RAISED}; color: {TEXT}; border: 1px solid {BORDER}; padding: 6px; }}
 """
 
 # Qt key -> drone_controller key name
@@ -67,10 +66,11 @@ def set_prop(widget, name, value):
         widget.style().polish(widget)
 
 
-def card():
-    frame = QFrame()
-    frame.setObjectName("Card")
-    return frame
+def label(text="", name=None):
+    lbl = QLabel(text)
+    if name:
+        lbl.setObjectName(name)
+    return lbl
 
 
 def button(text, slot, name=None, tone=None, checkable=False):
@@ -86,6 +86,23 @@ def button(text, slot, name=None, tone=None, checkable=False):
     return b
 
 
+def readout(caption):
+    """Caption above a value, e.g. BATTERY / 87 %. Returns (layout, value label)."""
+    box = QVBoxLayout()
+    box.setSpacing(0)
+    value = label("", "Value")
+    box.addWidget(label(caption, "Caption"))
+    box.addWidget(value)
+    return box, value
+
+
+def divider():
+    line = QFrame()
+    line.setObjectName("Divider")
+    line.setFixedWidth(1)
+    return line
+
+
 class VideoView(QLabel):
     """Video that scales with the window, with the current alert overlaid on top."""
 
@@ -98,7 +115,6 @@ class VideoView(QLabel):
         self.image = None
         self.banner = QLabel(self)
         self.banner.setObjectName("Banner")
-        self.banner.setAlignment(Qt.AlignCenter)
         self.banner.setWordWrap(True)
         self.banner.hide()
 
@@ -117,12 +133,13 @@ class VideoView(QLabel):
             return
         level, text = alert
         self.banner.setText(text)
-        self.banner.setStyleSheet(f"background: {LEVEL_COLORS[level]};")
+        # a coloured edge carries the severity; the bar itself stays quiet over the video
+        self.banner.setStyleSheet(f"border-left: 4px solid {LEVEL_COLORS[level]};")
         self.place_banner()
         self.banner.show()
 
     def place_banner(self):
-        self.banner.setFixedWidth(self.width() - 32)
+        self.banner.setFixedWidth(min(560, self.width() - 32))
         self.banner.adjustSize()
         self.banner.move(16, 16)
 
@@ -140,7 +157,7 @@ class FlightMap(QWidget):
     def __init__(self, controller):
         super().__init__()
         self.c = controller
-        self.setMinimumHeight(250)
+        self.setMinimumHeight(240)
         self.setCursor(Qt.CrossCursor)
         self.transform = None
 
@@ -157,9 +174,9 @@ class FlightMap(QWidget):
         c, w, h = self.c, self.width(), self.height()
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.setBrush(QColor("#0b0e12"))
-        p.setPen(Qt.NoPen)
-        p.drawRoundedRect(QRectF(0, 0, w, h), 14, 14)
+        p.setBrush(QColor("#0c0d0f"))
+        p.setPen(QPen(QColor(BORDER), 1))
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), 8, 8)
 
         path = [(x, y) for x, y, _ in c.points]
         people = [(x, y) for x, y, _ in c.person_points]
@@ -175,61 +192,58 @@ class FlightMap(QWidget):
         def pt(x, y):
             return QPointF(w / 2 + (x - mid_x) * scale, h / 2 - (y - mid_y) * scale)
 
-        p.setPen(QPen(QColor("#1c232c"), 1))  # 1 m grid
+        p.setPen(QPen(QColor("#1b1d20"), 1))  # 1 m grid
         for gx in range(int((mid_x - w / 2 / scale) // 100) * 100, int(mid_x + w / 2 / scale) + 100, 100):
-            p.drawLine(QPointF(pt(gx, 0).x(), 0), QPointF(pt(gx, 0).x(), h))
+            p.drawLine(QPointF(pt(gx, 0).x(), 1), QPointF(pt(gx, 0).x(), h - 1))
         for gy in range(int((mid_y - h / 2 / scale) // 100) * 100, int(mid_y + h / 2 / scale) + 100, 100):
-            p.drawLine(QPointF(0, pt(0, gy).y()), QPointF(w, pt(0, gy).y()))
+            p.drawLine(QPointF(1, pt(0, gy).y()), QPointF(w - 1, pt(0, gy).y()))
 
         small = QFont(self.font())
-        small.setPointSize(8)
-        small.setBold(True)
+        small.setPixelSize(11)
         p.setFont(small)
         if targets:
-            p.setPen(QPen(QColor(BLUE), 2, Qt.DashLine))
-            route = [pt(*q) for q in [origin] + targets]
-            p.drawPolyline(route)
+            p.setPen(QPen(QColor(ACCENT), 1.5, Qt.DashLine))
+            p.drawPolyline([pt(*q) for q in [origin] + targets])
             for i, target in enumerate(targets):
                 q = pt(*target)
                 current = c.plan_active and i == c.plan_index
-                p.setPen(QPen(QColor(BLUE), 2))
-                p.setBrush(QColor(BLUE) if current else QColor("#0b0e12"))
-                p.drawEllipse(q, 11, 11)
-                p.setPen(QColor("white"))
-                p.drawText(QRectF(q.x() - 11, q.y() - 11, 22, 22), Qt.AlignCenter, str(i + 1))
+                p.setPen(QPen(QColor(ACCENT), 1.5))
+                p.setBrush(QColor(ACCENT) if current else QColor("#0c0d0f"))
+                p.drawEllipse(q, 9, 9)
+                p.setPen(QColor("white") if current else QColor(ACCENT))
+                p.drawText(QRectF(q.x() - 9, q.y() - 9, 18, 18), Qt.AlignCenter, str(i + 1))
 
         if len(path) > 1:
-            p.setPen(QPen(QColor(GREEN), 3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.setPen(QPen(QColor("#9aa0a8"), 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             p.drawPolyline([pt(*q) for q in path])
 
         hq = pt(*(c.home if c.is_flying else origin))
-        p.setPen(QPen(QColor(AMBER), 2))
-        p.setBrush(QColor("#0b0e12"))
-        p.drawRoundedRect(QRectF(hq.x() - 11, hq.y() - 11, 22, 22), 5, 5)
-        p.setPen(QColor(AMBER))
-        p.drawText(QRectF(hq.x() - 11, hq.y() - 11, 22, 22), Qt.AlignCenter, "H")
+        p.setPen(QPen(QColor(TEXT), 1.5))
+        p.setBrush(QColor("#0c0d0f"))
+        p.drawRect(QRectF(hq.x() - 8, hq.y() - 8, 16, 16))
+        p.drawText(QRectF(hq.x() - 8, hq.y() - 8, 16, 16), Qt.AlignCenter, "H")
 
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(RED))
         for x, y in people:
             q = pt(x, y)
-            p.drawPolygon(QPolygonF([q + QPointF(0, -8), q + QPointF(8, 0), q + QPointF(0, 8), q + QPointF(-8, 0)]))
+            p.drawPolygon(QPolygonF([q + QPointF(0, -6), q + QPointF(6, 0), q + QPointF(0, 6), q + QPointF(-6, 0)]))
 
         dq = pt(c.x, c.y)
         heading = math.radians(dc.me.get_yaw() - c.yaw0)
-        p.setPen(QPen(QColor("white"), 3, Qt.SolidLine, Qt.RoundCap))
-        p.drawLine(dq, dq + QPointF(18 * math.sin(heading), -18 * math.cos(heading)))
+        p.setPen(QPen(QColor("white"), 2, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(dq, dq + QPointF(14 * math.sin(heading), -14 * math.cos(heading)))
         p.setBrush(QColor("white"))
         p.setPen(Qt.NoPen)
-        p.drawEllipse(dq, 6, 6)
+        p.drawEllipse(dq, 4.5, 4.5)
 
-        p.setPen(QColor(MUTED))
-        p.drawText(QRectF(12, 8, w - 24, 20), Qt.AlignLeft, "MAP · squares are 1 m")
+        p.setPen(QColor(FAINT))
+        p.drawText(QRectF(10, 8, w - 20, 16), Qt.AlignLeft, "Grid: 1 m")
         if people:
-            p.setPen(QColor(RED))
-            p.drawText(QRectF(12, 8, w - 24, 20), Qt.AlignRight, f"◆ {len(people)} found")
-        p.setPen(QColor("#5b6675"))
-        p.drawText(QRectF(12, h - 26, w - 24, 20), Qt.AlignLeft, "Click: add point   Right-click: undo")
+            p.setPen(QColor(MUTED))
+            p.drawText(QRectF(10, 8, w - 20, 16), Qt.AlignRight, f"{len(people)} sighting{'s' if len(people) > 1 else ''}")
+        p.setPen(QColor(FAINT))
+        p.drawText(QRectF(10, h - 24, w - 20, 16), Qt.AlignLeft, "Click to add a point, right-click to undo")
 
 
 class MainWindow(QWidget):
@@ -240,72 +254,69 @@ class MainWindow(QWidget):
         self.resize(1280, 800)
         self.notice_shown = ""
 
-        # top bar
+        # top bar: name and state on the left, telemetry on the right
         top = QHBoxLayout()
-        title = QLabel("GÖKBAĞ")
-        title.setObjectName("Title")
-        self.pill = QLabel()
-        self.pill.setObjectName("Pill")
-        self.battery = QLabel()
-        self.height_chip = QLabel()
-        self.signal_chip = QLabel()
-        for chip in (self.battery, self.height_chip, self.signal_chip):
-            chip.setObjectName("Chip")
-        self.notice = QLabel()
-        self.notice.setObjectName("Muted")
-        self.more_button = button("☰  More", self.toggle_more, checkable=True)
-        top.addWidget(title)
-        top.addSpacing(12)
-        top.addWidget(self.pill)
+        top.setSpacing(18)
+        self.state_dot = label("●")
+        self.state = label("", "State")
+        state = QHBoxLayout()
+        state.setSpacing(8)
+        state.addWidget(self.state_dot)
+        state.addWidget(self.state)
+        self.notice = label("", "Muted")
+        battery_box, self.battery = readout("BATTERY")
+        height_box, self.height_value = readout("HEIGHT")
+        signal_box, self.signal_value = readout("SIGNAL")
+        self.more_button = button("More", self.toggle_more, "Flat", checkable=True)
+        top.addWidget(label("GÖKBAĞ", "Title"))
+        top.addWidget(divider())
+        top.addLayout(state)
         top.addStretch()
         top.addWidget(self.notice)
-        top.addSpacing(8)
-        for widget in (self.battery, self.height_chip, self.signal_chip, self.more_button):
-            top.addWidget(widget)
+        for box in (battery_box, height_box, signal_box):
+            top.addLayout(box)
+        top.addWidget(divider())
+        top.addWidget(self.more_button)
 
-        # video + big buttons
+        # video + the four controls a beginner needs
         self.video = VideoView()
-        self.takeoff_button = button("", self.c.toggle_takeoff_land, "Big", "green")
-        self.home_button = button("", self.c.toggle_return_home, "Big", "amber")
-        self.follow_button = button("", self.c.toggle_follow, "Big", "grey")
-        self.stop_button = button("✋  STOP", self.c.hover, "Big", "red")
-        self.stop_button.setToolTip("Stop moving and hover in place (motors keep running)")
-        big_row = QHBoxLayout()
-        big_row.setSpacing(14)
+        self.takeoff_button = button("", self.c.toggle_takeoff_land, "Big", "primary")
+        self.home_button = button("", self.c.toggle_return_home, "Big")
+        self.follow_button = button("", self.c.toggle_follow, "Big")
+        self.stop_button = button("Stop", self.c.hover, "Big", "stop")
+        self.stop_button.setToolTip("Stop moving and hover in place. The motors keep running.")
+        controls = QHBoxLayout()
+        controls.setSpacing(10)
         for b in (self.takeoff_button, self.home_button, self.follow_button, self.stop_button):
-            big_row.addWidget(b, 1)
-        hint = QLabel("Fly with the arrow keys   ·   W / S  up and down   ·   A / D  turn")
-        hint.setObjectName("Muted")
-        hint.setAlignment(Qt.AlignCenter)
+            controls.addWidget(b, 1)
+        hint = label("Arrow keys move the drone, W and S go up and down, A and D turn. Let go to hover.", "Muted")
 
         main = QVBoxLayout()
-        main.setSpacing(14)
+        main.setSpacing(12)
         main.addLayout(top)
         main.addWidget(self.video, 1)
-        main.addLayout(big_row)
+        main.addLayout(controls)
         main.addWidget(hint)
 
         # "More" side panel
-        self.more = card()
-        self.more.setFixedWidth(380)
+        self.more = QFrame()
+        self.more.setObjectName("Panel")
+        self.more.setFixedWidth(360)
         more = QVBoxLayout(self.more)
-        more.setContentsMargins(18, 18, 18, 18)
-        more.setSpacing(10)
+        more.setContentsMargins(16, 16, 16, 16)
+        more.setSpacing(8)
 
         def section(text):
-            label = QLabel(text)
-            label.setObjectName("Section")
-            more.addSpacing(6)
-            more.addWidget(label)
+            more.addSpacing(10)
+            more.addWidget(label(text, "Caption"))
 
-        section("FLIGHT PLAN")
+        more.addWidget(label("FLIGHT PLAN", "Caption"))
         self.map = FlightMap(self.c)
         more.addWidget(self.map, 1)
-        self.plan_label = QLabel()
-        self.plan_label.setObjectName("Muted")
+        self.plan_label = label("", "Muted")
         more.addWidget(self.plan_label)
         plan_row = QHBoxLayout()
-        self.plan_button = button("▶  Fly plan", self.c.toggle_plan)
+        self.plan_button = button("Fly plan", self.c.toggle_plan)
         plan_row.addWidget(self.plan_button, 2)
         for text, slot in (("Clear", self.c.clear_plan), ("Save", self.save_plan), ("Load", self.load_plan)):
             plan_row.addWidget(button(text, slot), 1)
@@ -313,8 +324,8 @@ class MainWindow(QWidget):
 
         section("CAMERA")
         camera_row = QHBoxLayout()
-        self.record_button = button("⏺  Record", self.c.toggle_recording)
-        for b in (button("📷  Photo", self.c.capture_image), self.record_button, button("🗺  3D map", self.c.show_3d_map)):
+        self.record_button = button("Record", self.c.toggle_recording)
+        for b in (button("Photo", self.c.capture_image), self.record_button, button("3D map", self.c.show_3d_map)):
             camera_row.addWidget(b)
         more.addLayout(camera_row)
 
@@ -327,22 +338,21 @@ class MainWindow(QWidget):
             self.mission.addButton(b)
             mission_row.addWidget(b)
         more.addLayout(mission_row)
-        self.detect_box = QCheckBox("Show people on the video")
+        self.detect_box = QCheckBox("Show detected people on the video")
         self.detect_box.setFocusPolicy(Qt.NoFocus)
         self.detect_box.setChecked(True)
         self.detect_box.toggled.connect(lambda _: self.c.toggle_yolo())
         more.addWidget(self.detect_box)
 
         section("KEYS")
-        keys = QLabel("↑ ↓ ← →  move      W / S  up / down\nA / D  turn      E  take off      Q  land\nH  come home      SPACE  emergency motor cut")
-        keys.setObjectName("Muted")
-        more.addWidget(keys)
-        more.addSpacing(6)
-        more.addWidget(button("⚠  Emergency motor cut (Space) – drone falls!", self.c.emergency_stop, "Danger"))
+        more.addWidget(label("E take off   ·   Q land   ·   H come home\nSpace emergency motor cut", "Muted"))
+        more.addSpacing(10)
+        more.addWidget(button("Emergency motor cut (Space)", self.c.emergency_stop, "Danger"))
+        more.addWidget(label("Motors stop immediately and the drone falls.", "Muted"))
         self.more.hide()
 
         root = QHBoxLayout(self)
-        root.setContentsMargins(20, 18, 20, 18)
+        root.setContentsMargins(20, 16, 20, 16)
         root.setSpacing(16)
         root.addLayout(main, 1)
         root.addWidget(self.more)
@@ -376,17 +386,16 @@ class MainWindow(QWidget):
     def refresh(self):
         c = self.c
         text, level = c.flight_state()
-        self.pill.setText(f"●  {text}")
-        set_prop(self.pill, "level", level)
+        self.state.setText(text)
+        self.state_dot.setStyleSheet(f"color: {STATE_COLORS[level]}; font-size: 12px;")
 
         battery = dc.me.get_battery()
-        self.battery.setText(f"🔋 {battery}%")
-        self.battery.setStyleSheet(f"color: {GREEN if battery > 50 else AMBER if battery > 20 else RED};")
-        self.height_chip.setText(f"↕ {dc.me.get_height() / 100:.1f} m")
+        self.battery.setText(f"{battery} %")
+        self.battery.setStyleSheet("" if battery > 30 else f"color: {AMBER if battery > 20 else RED};")
+        self.height_value.setText(f"{dc.me.get_height() / 100:.1f} m")
         signal = c.signal
-        quality = "—" if signal is None else "Good" if signal >= 60 else "OK" if signal >= 30 else "Weak"
-        self.signal_chip.setText(f"📶 {quality}")
-        self.signal_chip.setToolTip(f"Wi-Fi signal-to-noise: {signal}")
+        self.signal_value.setText("–" if signal is None else "Good" if signal >= 60 else "Fair" if signal >= 30 else "Weak")
+        self.signal_value.setToolTip(f"Wi-Fi signal-to-noise: {signal}")
         self.video.show_alert(c.top_alert())
         if c.notice != self.notice_shown:
             self.notice_shown = c.notice
@@ -394,21 +403,22 @@ class MainWindow(QWidget):
             QTimer.singleShot(4000, lambda shown=c.notice: self.notice.setText("") if self.notice.text() == shown else None)
 
         flying = c.is_flying
-        self.takeoff_button.setText("🛬  Land" if flying else "🛫  Take off")
-        set_prop(self.takeoff_button, "tone", "indigo" if flying else "green")
+        self.takeoff_button.setText("Land" if flying else "Take off")
         self.takeoff_button.setEnabled(not c.busy)
-        self.home_button.setText("✖  Cancel" if c.returning else "🏠  Come home")
+        self.home_button.setText("Cancel return" if c.returning else "Come home")
+        set_prop(self.home_button, "tone", "active" if c.returning else None)
         self.home_button.setEnabled(flying and not c.busy)
-        self.follow_button.setText("👤  Following" if c.follow else "👤  Follow people")
-        set_prop(self.follow_button, "tone", "blue" if c.follow else "grey")
+        self.follow_button.setText("Following" if c.follow else "Follow people")
+        set_prop(self.follow_button, "tone", "active" if c.follow else None)
         self.stop_button.setEnabled(flying)
 
-        self.plan_button.setText("■  Stop plan" if c.plan_active else "▶  Fly plan")
-        self.record_button.setText("■  Stop recording" if c.writer is not None else "⏺  Record")
+        self.plan_button.setText("Stop plan" if c.plan_active else "Fly plan")
+        self.record_button.setText("Stop recording" if c.writer is not None else "Record")
         if c.waypoints:
-            self.plan_label.setText(f"{len(c.waypoints)} point(s) · about {c.plan_length() / 100:.1f} m there and back")
+            self.plan_label.setText(f"{len(c.waypoints)} point{'s' if len(c.waypoints) > 1 else ''}, "
+                                    f"about {c.plan_length() / 100:.1f} m there and back")
         else:
-            self.plan_label.setText("Click the map to add points for the drone to visit")
+            self.plan_label.setText("Click the map to add points for the drone to visit.")
 
     # ---- actions ------------------------------------------------------------
 

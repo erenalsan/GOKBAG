@@ -6,7 +6,7 @@ from utilities.user_management import verify_password, needs_rehash, make_record
 user_data_file = "user_data.json"
 users = load_users(user_data_file)
 
-RED, GREEN = "#fca5a5", "#86efac"
+RED, GREEN = "#e07a7a", "#7fc79b"
 MAX_ATTEMPTS = 5      # failed logins per username before a lockout
 LOCKOUT_SECONDS = 30
 
@@ -24,6 +24,7 @@ class LoginDialog(QDialog):
 
         title = QLabel("GÖKBAĞ")
         title.setObjectName("Title")
+        title.setStyleSheet("font-size: 20px;")
         title.setAlignment(Qt.AlignCenter)
         subtitle = QLabel("Drone ground control")
         subtitle.setObjectName("Muted")
@@ -36,7 +37,7 @@ class LoginDialog(QDialog):
         login_button = QPushButton("Log in")
         login_button.setDefault(True)  # Enter logs in
         login_button.setMinimumHeight(48)
-        login_button.setStyleSheet("background: #3b82f6; border: none; color: white; font-size: 16px; font-weight: 700;")
+        login_button.setStyleSheet("background: #4d8dff; border: none; color: white; font-size: 15px; font-weight: 600;")
         login_button.clicked.connect(self.login)
 
         layout = QVBoxLayout(self)
@@ -88,7 +89,7 @@ class AdminDialog(QDialog):
         self.setWindowTitle("User management")
         self.setFixedWidth(420)
         title = QLabel("User management")
-        title.setStyleSheet("font-size: 20px; font-weight: 800;")
+        title.setStyleSheet("font-size: 17px; font-weight: 600;")
         self.user_menu = QComboBox()
         self.user_menu.addItems(list(users))
         self.new_password = QLineEdit(placeholderText="New password")

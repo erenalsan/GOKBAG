@@ -48,7 +48,7 @@ GOKBAG_SIM=path/to/video.mp4 python main.py  # video file, loops
 ```
 
 __The main screen:__
-A big video with four buttons underneath: **Take off / Land**, **Come home**, **Follow people** and a red **STOP**. STOP makes the drone stop moving and hover in place; it never turns the motors off. Battery, height and signal are shown at the top, and alerts appear over the video. Everything else (map, flight plans, camera, mission mode, emergency motor cut) is in the **More** panel.
+A big video with four buttons underneath: **Take off / Land**, **Come home**, **Follow people** and a red **Stop**. Stop makes the drone stop moving and hover in place; it never turns the motors off. Battery, height and signal are shown at the top, and alerts appear over the video. Everything else (map, flight plans, camera, mission mode, emergency motor cut) is in the **More** panel.
 
 __Flying by hand:__
 Hold the arrow keys to move, W/S to go up/down, A/D to turn; let go and the drone hovers. Pressing a movement key always takes over from Follow, Come home and flight plans. E takes off, Q lands, H comes home.
