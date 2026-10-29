@@ -36,6 +36,7 @@ UD_KP, UD_DEADBAND = 0.3, 30
 FB_KP, TARGET_AREA_MIN, TARGET_AREA_MAX = 0.004, 8000, 25000
 SEARCH_YAW = 20            # turn in place when nobody is visible (report MACS03)
 SAR_CAPTURE_COOLDOWN = 3   # s between automatic search & rescue photos
+DETECT_HZ = 10             # detections per second; control acts at 4 Hz, more only burns CPU
 
 # Return to home. Position is estimated in rc-units x seconds and the way back is flown with rc commands too,
 # so the unknown rc->speed scale cancels out; accuracy is limited by drift, not calibration.
@@ -456,11 +457,13 @@ class DroneController:
 
     def detection_worker(self):
         # YOLO runs here so slow inference never stalls the video or the controls
+        next_run = 0
         while self.running:
             frame = self.latest_frame
-            if not self.yolo_enabled or frame is None or frame is self.detected_frame:
+            if not self.yolo_enabled or frame is None or frame is self.detected_frame or time.monotonic() < next_run:
                 time.sleep(0.01)
                 continue
+            next_run = time.monotonic() + 1 / DETECT_HZ
             self.detected_frame = frame
             try:
                 detections = self.detect(frame)

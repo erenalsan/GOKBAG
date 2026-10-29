@@ -350,7 +350,7 @@ class MainWindow(QWidget):
         root.addLayout(main, 1)
         root.addWidget(self.side)
 
-        self.video_timer = QTimer(self, timeout=self.tick_video, interval=15)
+        self.video_timer = QTimer(self, timeout=self.tick_video, interval=33)  # the Tello camera sends ~30 fps
         self.control_timer = QTimer(self, timeout=self.tick_control, interval=int(self.c.interval * 1000))
         self.refresh()
 
