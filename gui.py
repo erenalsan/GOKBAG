@@ -283,14 +283,17 @@ class MainWindow(QWidget):
         controls.setSpacing(10)
         for b in (self.takeoff_button, self.home_button, self.follow_button, self.stop_button):
             controls.addWidget(b, 1)
-        hint = label("Arrow keys move the drone, W and S go up and down, A and D turn. Let go to hover.", "Muted")
+        hint = QHBoxLayout()
+        hint.addWidget(label("Arrow keys move the drone, W and S go up and down, A and D turn. Let go to hover.", "Muted"))
+        hint.addStretch()
+        hint.addWidget(label(f"Detection: {self.c.yolo_model.name}", "Muted"))
 
         main = QVBoxLayout()
         main.setSpacing(12)
         main.addLayout(top)
         main.addWidget(self.video, 1)
         main.addLayout(controls)
-        main.addWidget(hint)
+        main.addLayout(hint)
 
         # side panel: map, flight plan, camera, mission
         self.side = QFrame()

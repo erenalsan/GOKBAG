@@ -24,6 +24,14 @@ Install required Python libraries
 pip install -r requirements.txt
 ```
 
+__Using a GPU (optional):__
+Person detection picks the fastest hardware automatically and shows it in the bottom-right corner ("Detection: ..."):
+- NVIDIA: install a CUDA build of PyTorch (pick the command for your CUDA version at pytorch.org), e.g. `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128`. Detection then runs in FP16 on every camera frame.
+- Fastest on NVIDIA: also `pip install tensorrt`. On first start a TensorRT engine is built for your GPU (a few minutes, once) and cached as `yolo26n.engine`; delete it after changing GPU or TensorRT version.
+- AMD graphics cards: install the ROCm build of PyTorch (Linux, pytorch.org); it is used like CUDA. Integrated Radeon graphics in laptops is not supported by ROCm and uses the CPU.
+- Apple silicon: used automatically (MPS).
+- Force a device with `GOKBAG_DEVICE=cpu`, `cuda:1`, `mps`, ...
+
 # Project Structure
 main.py / login.py: Login window; regular users open the drone controller, `admin` opens user management.\
 gui.py: The ground control window (PySide6/Qt).\

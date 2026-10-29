@@ -36,7 +36,8 @@ UD_KP, UD_DEADBAND = 0.3, 30
 FB_KP, TARGET_AREA_MIN, TARGET_AREA_MAX = 0.004, 8000, 25000
 SEARCH_YAW = 20            # turn in place when nobody is visible (report MACS03)
 SAR_CAPTURE_COOLDOWN = 3   # s between automatic search & rescue photos
-DETECT_HZ = 10             # detections per second; control acts at 4 Hz, more only burns CPU
+DETECT_HZ = 10             # detections per second on CPU; control acts at 4 Hz, more only burns CPU
+DETECT_HZ_GPU = 30         # on a GPU detection is cheap, so check every camera frame
 
 # Return to home. Position is estimated in rc-units x seconds and the way back is flown with rc commands too,
 # so the unknown rc->speed scale cancels out; accuracy is limited by drift, not calibration.
@@ -125,6 +126,7 @@ class DroneController:
         self.points = [(self.x, self.y, self.z)]
         self.person_points = []
         self.yolo_model = YOLOModel()
+        self.detect_hz = DETECT_HZ_GPU if self.yolo_model.on_gpu else DETECT_HZ
 
     def start(self):
         threading.Thread(target=self.detection_worker, daemon=True).start()
@@ -463,7 +465,7 @@ class DroneController:
             if not self.yolo_enabled or frame is None or frame is self.detected_frame or time.monotonic() < next_run:
                 time.sleep(0.01)
                 continue
-            next_run = time.monotonic() + 1 / DETECT_HZ
+            next_run = time.monotonic() + 1 / self.detect_hz
             self.detected_frame = frame
             try:
                 detections = self.detect(frame)

@@ -319,6 +319,77 @@ class FlightPlanTest(unittest.TestCase):
         self.assertRaises(ValueError, dc.parse_plan, far)
 
 
+class DeviceTest(unittest.TestCase):
+    """GPU selection, simulated: the test machine has no supported GPU."""
+
+    def setUp(self):
+        from utilities import yolo_model
+        self.ym = yolo_model
+        self.env = mock.patch.dict(os.environ, {}, clear=False)
+        self.env.start()
+        os.environ.pop("GOKBAG_DEVICE", None)
+
+    def tearDown(self):
+        self.env.stop()
+
+    def gpu(self, cuda=False, mps=False):
+        return [mock.patch.object(self.ym.torch.cuda, "is_available", return_value=cuda),
+                mock.patch.object(self.ym.torch.backends.mps, "is_available", return_value=mps),
+                mock.patch.object(self.ym.torch.cuda, "get_device_name", return_value="Test RTX")]
+
+    def run_with(self, patches, fn):
+        for p in patches:
+            p.start()
+        try:
+            return fn()
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_pick_device_order_and_override(self):
+        self.assertEqual(self.run_with(self.gpu(cuda=True, mps=True), self.ym.pick_device), "cuda:0")
+        self.assertEqual(self.run_with(self.gpu(mps=True), self.ym.pick_device), "mps")
+        self.assertEqual(self.run_with(self.gpu(), self.ym.pick_device), "cpu")
+        os.environ["GOKBAG_DEVICE"] = "cpu"
+        self.assertEqual(self.run_with(self.gpu(cuda=True), self.ym.pick_device), "cpu")
+
+    def test_cuda_uses_fp16_and_passes_device(self):
+        yolo = mock.MagicMock()
+        patches = self.gpu(cuda=True) + [mock.patch.object(self.ym, "YOLO", yolo),
+                                         mock.patch.object(self.ym.importlib.util, "find_spec", return_value=None)]
+        model = self.run_with(patches, self.ym.YOLOModel)
+        self.assertTrue(model.half and model.on_gpu)
+        self.assertEqual(model.name, "Test RTX (PyTorch, FP16)")
+        model.predict("frame")
+        _, kwargs = yolo.return_value.predict.call_args
+        self.assertEqual((kwargs["device"], kwargs["half"]), ("cuda:0", True))
+
+    def test_cpu_stays_fp32(self):
+        patches = self.gpu() + [mock.patch.object(self.ym, "YOLO", mock.MagicMock())]
+        model = self.run_with(patches, self.ym.YOLOModel)
+        self.assertFalse(model.half or model.on_gpu)
+        self.assertEqual(model.name, "CPU (PyTorch)")
+
+    def test_tensorrt_engine_built_and_used_when_installed(self):
+        weights = os.path.join(tempfile.mkdtemp(), "yolo26n.pt")
+        yolo = mock.MagicMock()
+        patches = self.gpu(cuda=True) + [mock.patch.object(self.ym, "YOLO", yolo),
+                                         mock.patch.object(self.ym.importlib.util, "find_spec", return_value=object())]
+        model = self.run_with(patches, lambda: self.ym.YOLOModel(weights))
+        yolo.return_value.export.assert_called_once()
+        self.assertEqual(yolo.call_args_list[1].args[0], weights.replace(".pt", ".engine"))
+        self.assertEqual(model.engine, "TensorRT")
+
+    def test_tensorrt_failure_falls_back_to_pytorch_fp16(self):
+        yolo = mock.MagicMock()
+        yolo.return_value.export.side_effect = RuntimeError("no TensorRT for this GPU")
+        patches = self.gpu(cuda=True) + [mock.patch.object(self.ym, "YOLO", yolo),
+                                         mock.patch.object(self.ym.importlib.util, "find_spec", return_value=object())]
+        model = self.run_with(patches, lambda: self.ym.YOLOModel(os.path.join(tempfile.mkdtemp(), "m.pt")))
+        self.assertEqual(model.engine, "PyTorch")
+        self.assertTrue(model.half)
+
+
 class FlightLogTest(unittest.TestCase):
     def test_round_trip_with_sightings_never_writes_plaintext(self):
         f = os.path.join(tempfile.mkdtemp(), "log.csv")
