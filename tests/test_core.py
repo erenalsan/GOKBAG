@@ -24,6 +24,7 @@ def make_controller():
     c.width, c.height, c.min_area = 640, 480, 3000
     c.interval, c.speed = 0.25, 50
     c.x, c.y, c.z, c.yaw0 = 0.0, 0.0, 0, 0
+    c.home, c.returning, c.rth_triggered = (0.0, 0.0), False, False
     c.points, c.person_points = [], []
     c.prev_err_x, c.searching = 0, False
     c.pressed_keys = set()
@@ -142,6 +143,59 @@ class SafetyTest(unittest.TestCase):
             c.takeoff()
         c.run_drone_command.assert_not_called()
         self.assertIn("preflight", c.alerts)
+
+
+class ReturnHomeTest(unittest.TestCase):
+    def test_turns_toward_home_before_flying(self):
+        c = make_controller()
+        c.x = 100.0  # home is to the left (west) of the drone, which faces north
+        with mock.patch.object(dc.me, "get_yaw", return_value=0):
+            lr, fb, ud, yaw = c.return_home_rc()
+        self.assertLess(yaw, 0)
+        self.assertEqual(fb, 0)
+        with mock.patch.object(dc.me, "get_yaw", return_value=-90):
+            self.assertEqual(c.return_home_rc(), [0, dc.RTH_SPEED, 0, 0])
+
+    def test_round_trip_lands_near_takeoff_point(self):
+        c = make_controller()
+        c.is_flying = True
+        c.land = mock.MagicMock()
+        sim = {"yaw": 0.0}
+
+        def step(rc):  # the drone turns rc-yaw degrees per second
+            sim["yaw"] = dc.wrap_degrees(sim["yaw"] + rc[3] * c.interval)
+            c.log_flight_path(*rc)
+
+        with mock.patch.object(dc.me, "get_yaw", side_effect=lambda: int(sim["yaw"])), \
+                mock.patch.object(dc.me, "get_height", return_value=100):
+            for rc in [[0, 50, 0, 0]] * 12 + [[0, 0, 0, 50]] * 8 + [[0, 50, 0, 0]] * 8:  # out, turn right, out
+                step(rc)
+            self.assertGreater(c.home_distance(), 150)
+            c.start_return_home("test")
+            for _ in range(400):
+                if not c.returning:
+                    break
+                step(c.return_home_rc())
+        c.land.assert_called_once()
+        self.assertLess(c.home_distance(), dc.RTH_ARRIVE)
+
+    def test_low_battery_returns_home_once_then_lands(self):
+        c = make_controller()
+        c.is_flying, c.x = True, 500.0
+        c.land = mock.MagicMock()
+        c.check_battery(dc.RTH_BATTERY)
+        self.assertTrue(c.returning)
+        c.cancel_return_home("operator")
+        c.check_battery(dc.RTH_BATTERY - 1)
+        self.assertFalse(c.returning)  # not re-triggered after the operator cancelled
+        c.check_battery(dc.AUTO_LAND_BATTERY)
+        c.land.assert_called_once()
+
+    def test_manual_key_cancels_return(self):
+        c = make_controller()
+        c.is_flying, c.returning, c.manual_control_enabled = True, True, True
+        c.on_key_press(mock.Mock(keysym="Up"))
+        self.assertFalse(c.returning)
 
 
 class FlightLogTest(unittest.TestCase):

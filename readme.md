@@ -58,7 +58,8 @@ Operational labels people as Ally (large/close) or Hostile (small/far); this is 
 
 __Safety:__
 - Preflight check before takeoff: telemetry link, battery at least 20%, temperature below 90°C.
-- Low battery: warning at 20%, automatic landing at 10%.
+- Low battery: warning at 30%, automatic return home at 20%, landing wherever it is at 10%.
+- Return home (H key or button): turns toward the takeoff point, flies back and lands. There is no GPS: the position is estimated from the commands flown, so expect to land within roughly a meter or two of the takeoff point. Any manual movement key cancels it. It cannot work after a link loss, since commands use the same Wi-Fi.
 - Link watchdog: shows LINK LOST when telemetry stops for 2 s (the Tello itself lands after 15 s without commands).
 - Height limit of 400 cm, emergency stop with SPACE or the red button (cuts the motors immediately).
 - Alerts appear as a banner over the video.

@@ -26,8 +26,9 @@ GREEN, GREEN_HOVER, RED, RED_HOVER, AMBER, MUTED = "#2fa572", "#258a5e", "#d6454
 
 # Safety limits
 MIN_TAKEOFF_BATTERY = 20   # % preflight check
-LOW_BATTERY_WARNING = 20   # %
-AUTO_LAND_BATTERY = 10     # % lands by itself (report GCS04)
+LOW_BATTERY_WARNING = 30   # %
+RTH_BATTERY = 20           # % flies back to the takeoff point by itself
+AUTO_LAND_BATTERY = 10     # % lands wherever it is (report GCS04)
 MAX_TEMPERATURE = 90       # °C preflight check
 MAX_HEIGHT_CM = 400        # climbing is blocked above this
 LINK_TIMEOUT = 2.0         # s without a telemetry packet = link lost (Tello sends ~10/s)
@@ -38,6 +39,13 @@ UD_KP, UD_DEADBAND = 0.3, 30
 FB_KP, TARGET_AREA_MIN, TARGET_AREA_MAX = 0.004, 8000, 25000
 SEARCH_YAW = 20            # turn in place when nobody is visible (report MACS03)
 SAR_CAPTURE_COOLDOWN = 3   # s between automatic search & rescue photos
+
+# Return to home. Position is estimated in rc-units x seconds and the way back is flown with rc commands too,
+# so the unknown rc->speed scale cancels out; accuracy is limited by drift, not calibration.
+RTH_SPEED = 40             # rc forward value on the way home
+RTH_ARRIVE = 30            # estimated distance at which it lands
+RTH_HEADING_KP = 1.5       # degrees of heading error -> rc yaw
+RTH_ALIGNED = 15           # degrees; flies forward only when roughly facing home
 
 # Tk keysym -> (axis index in [lr, fb, ud, yv], sign)
 KEY_BINDINGS = {
@@ -51,6 +59,10 @@ ALERT_COLORS = {"error": RED, "warn": AMBER, "info": GREEN}
 
 def clamp(value, limit):
     return int(max(-limit, min(limit, value)))
+
+
+def wrap_degrees(angle):
+    return (angle + 180) % 360 - 180
 
 
 class DroneController:
@@ -87,6 +99,8 @@ class DroneController:
         self.last_state_time = time.monotonic()
         self.signal = None
         self.auto_landed = False
+        self.returning = False
+        self.rth_triggered = False
 
         self.width = 640
         self.height = 480
@@ -99,6 +113,7 @@ class DroneController:
         self.x, self.y, self.z = 500, 500, 0
         self.yaw0 = 0
 
+        self.home = (self.x, self.y)
         self.points = [(self.x, self.y, self.z)]
         self.person_points = []
         self.yolo_model = YOLOModel()
@@ -133,7 +148,7 @@ class DroneController:
         self.map_canvas = Canvas(bottom, width=330, height=150, bg="#1a1a1a", bd=0, highlightthickness=0)
         self.map_canvas.pack(side="left")
         self.keys_label = customtkinter.CTkLabel(bottom, justify="left", text_color=MUTED, font=customtkinter.CTkFont(family="monospace", size=12),
-                                                 text="↑ ↓ ← →  move\nW / S    up / down\nA / D    rotate\nE / Q    take off / land\nSPACE    emergency stop")
+                                                 text="↑ ↓ ← →  move\nW / S    up / down\nA / D    rotate\nE / Q    take off / land\nH        return home\nSPACE    emergency stop")
         self.keys_label.pack(side="right", anchor="n")
 
         side = customtkinter.CTkFrame(self.root, fg_color="transparent", width=280)
@@ -165,6 +180,9 @@ class DroneController:
         self.takeoff_land_button.pack(fill="x", padx=14, pady=(8, 8))
         customtkinter.CTkButton(flight, text="Emergency stop (Space)", fg_color="transparent", border_width=1, border_color=RED, text_color=RED,
                                 hover_color="#3a2222", command=self.emergency_stop).pack(fill="x", padx=14, pady=(0, 8))
+        self.home_button = customtkinter.CTkButton(flight, text="Return home (H)", fg_color="transparent", border_width=1, border_color=AMBER,
+                                                   text_color=AMBER, hover_color="#3a3222", command=self.toggle_return_home)
+        self.home_button.pack(fill="x", padx=14, pady=(0, 8))
         tools = customtkinter.CTkFrame(flight, fg_color="transparent")
         tools.pack(fill="x", padx=14)
         tools.columnconfigure((0, 1, 2), weight=1)
@@ -253,8 +271,11 @@ class DroneController:
             return
         self.clear_alert("preflight")
         self.clear_alert("emergency")
+        self.clear_alert("home")
         self.auto_landed = False
+        self.rth_triggered = False
         self.yaw0 = me.get_yaw()
+        self.home = (self.x, self.y)
         self.points = [(self.x, self.y, self.z)]
         self.person_points = []
         self.run_drone_command(me.takeoff, flying_after=True)
@@ -262,16 +283,50 @@ class DroneController:
     def land(self):
         if not self.is_flying:
             return
+        self.returning = False
         self.run_drone_command(me.land, flying_after=False)
         self.save_flight_log()
 
     def emergency_stop(self):
         # cuts the motors at once, the drone falls; no reply to wait for, so no lock
         me.emergency()
+        self.returning = False
         was_flying, self.is_flying = self.is_flying, False
         self.set_alert("emergency", "EMERGENCY STOP: motors cut", "error")
         if was_flying:
             self.save_flight_log()
+
+    def toggle_return_home(self):
+        if self.returning:
+            self.cancel_return_home("Return home cancelled")
+        else:
+            self.start_return_home("Returning home")
+
+    def start_return_home(self, reason):
+        if not self.is_flying or self.busy:
+            return
+        self.returning = True
+        self.set_alert("home", f"{reason}: ~{self.home_distance() / 100:.1f} m to takeoff point (estimated)", "warn")
+
+    def cancel_return_home(self, message):
+        if self.returning:
+            self.returning = False
+            self.set_alert("home", message, "info")
+
+    def home_distance(self):
+        return math.hypot(self.home[0] - self.x, self.home[1] - self.y)
+
+    def return_home_rc(self):
+        if self.home_distance() < RTH_ARRIVE:
+            self.returning = False
+            self.set_alert("home", "Home reached: landing", "info")
+            self.land()
+            return [0, 0, 0, 0]
+        self.set_alert("home", f"Returning home: ~{self.home_distance() / 100:.1f} m to go (estimated)", "warn")
+        bearing = math.degrees(math.atan2(self.home[0] - self.x, self.home[1] - self.y))  # clockwise from takeoff heading
+        error = wrap_degrees(bearing - (me.get_yaw() - self.yaw0))
+        forward = RTH_SPEED if abs(error) < RTH_ALIGNED else 0
+        return [0, forward, 0, clamp(RTH_HEADING_KP * error, 60)]
 
     def run_drone_command(self, command, flying_after):
         # takeoff/land wait for the drone's reply, so keep them off the GUI thread
@@ -306,6 +361,7 @@ class DroneController:
     # ---- input --------------------------------------------------------------
 
     def set_control(self, value):
+        self.cancel_return_home("Return home cancelled: control changed")
         self.manual_control_enabled = value == "Manual"
         self.pressed_keys.clear()
         self.auto_rc = [0, 0, 0, 0]
@@ -317,7 +373,12 @@ class DroneController:
         if key == "space":
             self.emergency_stop()
             return
+        if key == "h":
+            self.toggle_return_home()
+            return
         self.pressed_keys.add(key)
+        if key in KEY_BINDINGS and self.manual_control_enabled:
+            self.cancel_return_home("Return home cancelled: operator took control")
         if not self.manual_control_enabled:
             return
         if key == "q":
@@ -414,7 +475,9 @@ class DroneController:
 
     def control_loop(self):
         try:
-            if self.manual_control_enabled:
+            if self.returning and self.is_flying and not self.busy:
+                rc = self.return_home_rc()
+            elif self.manual_control_enabled:
                 rc = self.get_keyboard_input()
             elif self.yolo_enabled:
                 rc = list(self.auto_rc)
@@ -466,6 +529,10 @@ class DroneController:
             self.auto_landed = True
             self.set_alert("battery", f"Battery {battery}%: landing automatically", "error")
             self.land()
+        elif self.is_flying and not self.busy and battery <= RTH_BATTERY and not self.rth_triggered:
+            self.rth_triggered = True  # once per flight, so the operator can cancel it
+            self.set_alert("battery", f"Battery {battery}%: returning home", "warn")
+            self.start_return_home("Low battery")
         elif battery <= LOW_BATTERY_WARNING:
             self.set_alert("battery", f"Low battery {battery}%: land soon", "warn")
         else:
@@ -485,11 +552,14 @@ class DroneController:
             state, color = "LINK LOST", RED
         elif self.busy:
             state, color = ("LANDING", AMBER) if self.is_flying else ("TAKING OFF", AMBER)
+        elif self.returning:
+            state, color = "RETURNING HOME", AMBER
         else:
             state, color = ("AIRBORNE", GREEN) if self.is_flying else ("LANDED", MUTED)
         self.state_label.configure(text=f"● {state}", text_color=color)
         control = "Manual" if self.manual_control_enabled else "Auto (searching)" if self.searching and self.is_flying else "Auto"
         self.info_label.configure(text=f"{control} · {self.mode_switch.get()}")
+        self.home_button.configure(text="Cancel return" if self.returning else "Return home (H)")
         self.takeoff_land_button.configure(text="Land" if self.is_flying else "Take off",
                                            fg_color=RED if self.is_flying else GREEN,
                                            hover_color=RED_HOVER if self.is_flying else GREEN_HOVER,
@@ -579,7 +649,7 @@ class DroneController:
         w, h = int(c["width"]), int(c["height"])
         path = [(x, y) for x, y, _ in self.points]
         people = [(x, y) for x, y, _ in self.person_points]
-        xs, ys = [p[0] for p in path + people], [p[1] for p in path + people]
+        xs, ys = [p[0] for p in path + people + [self.home]], [p[1] for p in path + people + [self.home]]
         span = max(200, max(xs) - min(xs), max(ys) - min(ys))  # at least 2 m across
         scale = min(w, h) * 0.8 / span
         mid_x, mid_y = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
@@ -589,6 +659,9 @@ class DroneController:
 
         if len(path) > 1:
             c.create_line(*[v for p in path for v in to_canvas(*p)], fill=GREEN, width=2)
+        hx, hy = to_canvas(*self.home)
+        c.create_rectangle(hx - 7, hy - 7, hx + 7, hy + 7, outline=AMBER, width=2)
+        c.create_text(hx, hy, text="H", fill=AMBER, font=("TkDefaultFont", 7, "bold"))
         for x, y in people:
             px, py = to_canvas(x, y)
             c.create_polygon(px, py - 6, px + 6, py, px, py + 6, px - 6, py, fill=RED)
@@ -601,7 +674,5 @@ class DroneController:
             c.create_text(w - 8, 8, anchor="ne", text=f"◆ {len(people)} sighting(s)", fill=RED, font=("TkDefaultFont", 8))
 
     def save_flight_log(self):
-        if self.points:
-            self.points.pop(0)
-        ccsv.make_csv(self.points, detections=self.person_points)
-        self.points = [(self.x, self.y, self.z)]
+        # first point is the pre-takeoff position; the path stays on the mini-map until the next takeoff
+        ccsv.make_csv(self.points[1:], detections=self.person_points)
