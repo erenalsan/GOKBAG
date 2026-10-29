@@ -1,17 +1,15 @@
+"""Flight logic: drone link, safety, tracking, return home, flight plans and logs. No UI code; see gui.py."""
 import os
 import sys
 import time
 import math
 import json
-import signal
 import subprocess
 import threading
 import traceback
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
-import customtkinter
-from tkinter import Label, Canvas, filedialog
+from PIL import Image
 from utilities.yolo_model import YOLOModel
 import utilities.coord_csv_module as ccsv
 
@@ -22,9 +20,6 @@ if os.environ.get("GOKBAG_SIM"):
 else:
     from djitellopy import Tello
     me = Tello()
-
-GREEN, GREEN_HOVER, RED, RED_HOVER, AMBER, MUTED = "#2fa572", "#258a5e", "#d64545", "#b33838", "#e0a526", "gray60"
-BLUE = "#5aa9e6"
 
 # Safety limits
 MIN_TAKEOFF_BATTERY = 20   # % preflight check
@@ -48,16 +43,15 @@ RTH_SPEED = 40             # rc forward value on the way home
 RTH_ARRIVE = 30            # estimated distance at which it lands
 RTH_HEADING_KP = 1.5       # degrees of heading error -> rc yaw
 RTH_ALIGNED = 15           # degrees; flies forward only when roughly facing home
-MAP_MIN_SPAN = 600         # the flight map always shows at least ~6 m, so waypoints can be placed
 
-# Tk keysym -> (axis index in [lr, fb, ud, yv], sign)
+# key name -> (axis index in [lr, fb, ud, yv], sign)
 KEY_BINDINGS = {
     "left": (0, -1), "right": (0, 1),
     "up": (1, 1), "down": (1, -1),
     "w": (2, 1), "s": (2, -1),
     "a": (3, -1), "d": (3, 1),
 }
-ALERT_COLORS = {"error": RED, "warn": AMBER, "info": GREEN}
+ALERT_LEVELS = ("error", "warn", "info")  # most severe first
 
 
 def clamp(value, limit):
@@ -79,21 +73,17 @@ def parse_plan(filename):
 
 
 class DroneController:
-    def __init__(self, root=None):
+    def __init__(self):
         me.connect()
         me.streamon()
-        self.root = root or customtkinter.CTk()
-        self.root.title("GÖKBAĞ Ground Control")
-        self.root.resizable(False, False)
-        self.build_ui()
 
         self.yolo_enabled = True
+        self.follow = False        # FOLLOW button: track people automatically
         self.is_flying = False
         self.busy = False  # takeoff/land in progress on a worker thread
         # djitellopy matches replies to commands by order, so commands that wait for a reply must not overlap
         self.cmd_lock = threading.Lock()
         self.running = True
-        self.manual_control_enabled = False
         self.current_mode = "operational"
         self.pressed_keys = set()
         self.auto_rc = [0, 0, 0, 0]
@@ -106,6 +96,7 @@ class DroneController:
         self.last_sar_capture = 0
         self.writer = None
         self.alerts = {}
+        self.notice = ""  # short confirmation for the UI, e.g. "Photo saved"
 
         self.link_ok = True
         self.last_state = None
@@ -117,8 +108,6 @@ class DroneController:
         self.waypoints = []        # (dx, dy) offsets from the takeoff point, +y = takeoff heading
         self.plan_active = False
         self.plan_index = 0
-        self.map_transform = None
-        self.update_plan_label()
 
         self.width = 640
         self.height = 480
@@ -136,140 +125,23 @@ class DroneController:
         self.person_points = []
         self.yolo_model = YOLOModel()
 
-        # Keyboard is read from this window, no separate pygame window needed.
-        self.root.bind("<KeyPress>", self.on_key_press)
-        self.root.bind("<KeyRelease>", self.on_key_release)
-        self.root.protocol("WM_DELETE_WINDOW", self.root.destroy)
-
-    def build_ui(self):
-        heading = customtkinter.CTkFont(size=13, weight="bold")
-        big = customtkinter.CTkFont(size=24, weight="bold")
-        small = customtkinter.CTkFont(size=11)
-
-        # left: flight state bar, alerts, video, mini-map
-        left = customtkinter.CTkFrame(self.root, corner_radius=12)
-        left.grid(row=0, column=0, padx=(16, 8), pady=16, sticky="n")
-        bar = customtkinter.CTkFrame(left, fg_color="transparent")
-        bar.pack(fill="x", padx=14, pady=(10, 6))
-        self.state_label = customtkinter.CTkLabel(bar, text="● LANDED", font=heading, text_color=MUTED)
-        self.state_label.pack(side="left")
-        self.info_label = customtkinter.CTkLabel(bar, text="", text_color=MUTED)
-        self.info_label.pack(side="right")
-        # plain tk Label: a PhotoImage per frame is much cheaper than CTkImage rescaling
-        self.cap_lbl = Label(left, text="Waiting for video…", fg="gray50", bg="#1a1a1a", bd=0, highlightthickness=0, width=80, height=30)
-        self.cap_lbl.pack(padx=14, pady=(0, 10))
-        # overlaid on the video top so alerts appearing/clearing never resize the window
-        self.alert_label = customtkinter.CTkLabel(left, text="", corner_radius=0, text_color="white", font=heading, height=32)
-
-        bottom = customtkinter.CTkFrame(left, fg_color="transparent")
-        bottom.pack(fill="x", padx=14, pady=(0, 14))
-        self.map_canvas = Canvas(bottom, width=330, height=150, bg="#1a1a1a", bd=0, highlightthickness=0)
-        self.map_canvas.pack(side="left")
-        self.map_canvas.bind("<Button-1>", self.add_waypoint)
-        self.map_canvas.bind("<Button-3>", self.remove_last_waypoint)
-        self.keys_label = customtkinter.CTkLabel(bottom, justify="left", text_color=MUTED, font=customtkinter.CTkFont(family="monospace", size=12),
-                                                 text="↑ ↓ ← →  move\nW / S    up / down\nA / D    rotate\nE / Q    take off / land\nH        return home\nSPACE    emergency stop")
-        self.keys_label.pack(side="right", anchor="n")
-
-        side = customtkinter.CTkFrame(self.root, fg_color="transparent", width=280)
-        side.grid(row=0, column=1, padx=(8, 16), pady=16, sticky="ns")
-
-        def card(title):
-            frame = customtkinter.CTkFrame(side, corner_radius=12)
-            frame.pack(fill="x", pady=(0, 12))
-            customtkinter.CTkLabel(frame, text=title.upper(), font=customtkinter.CTkFont(size=11, weight="bold"), text_color=MUTED).pack(anchor="w", padx=14, pady=(10, 0))
-            return frame
-
-        telemetry = card("Telemetry")
-        numbers = customtkinter.CTkFrame(telemetry, fg_color="transparent")
-        numbers.pack(fill="x", padx=14)
-        numbers.columnconfigure((0, 1, 2), weight=1)
-        self.battery_label = customtkinter.CTkLabel(numbers, text="--%", font=big)
-        self.battery_label.grid(row=0, column=0, sticky="w")
-        self.height_label = customtkinter.CTkLabel(numbers, text="-- cm", font=big)
-        self.height_label.grid(row=0, column=1, sticky="w")
-        self.signal_label = customtkinter.CTkLabel(numbers, text="--", font=big)
-        self.signal_label.grid(row=0, column=2, sticky="w")
-        for column, caption in enumerate(("Battery", "Height", "Signal")):
-            customtkinter.CTkLabel(numbers, text=caption, text_color=MUTED).grid(row=1, column=column, sticky="w")
-        self.battery_bar = customtkinter.CTkProgressBar(telemetry, height=8)
-        self.battery_bar.pack(fill="x", padx=14, pady=(6, 14))
-
-        flight = card("Flight")
-        self.takeoff_land_button = customtkinter.CTkButton(flight, text="Take off", height=44, font=heading, fg_color=GREEN, hover_color=GREEN_HOVER, command=self.toggle_takeoff_land)
-        self.takeoff_land_button.pack(fill="x", padx=14, pady=(8, 8))
-        customtkinter.CTkButton(flight, text="Emergency stop (Space)", fg_color="transparent", border_width=1, border_color=RED, text_color=RED,
-                                hover_color="#3a2222", command=self.emergency_stop).pack(fill="x", padx=14, pady=(0, 8))
-        self.home_button = customtkinter.CTkButton(flight, text="Return home (H)", fg_color="transparent", border_width=1, border_color=AMBER,
-                                                   text_color=AMBER, hover_color="#3a3222", command=self.toggle_return_home)
-        self.home_button.pack(fill="x", padx=14, pady=(0, 8))
-        tools = customtkinter.CTkFrame(flight, fg_color="transparent")
-        tools.pack(fill="x", padx=14)
-        tools.columnconfigure((0, 1, 2), weight=1)
-        outline = dict(fg_color="transparent", border_width=1, border_color="gray40", width=70)
-        customtkinter.CTkButton(tools, text="Photo", command=self.capture_image, **outline).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.record_button = customtkinter.CTkButton(tools, text="Record", command=self.toggle_recording, **outline)
-        self.record_button.grid(row=0, column=1, sticky="ew", padx=4)
-        customtkinter.CTkButton(tools, text="3D map", command=self.show_3d_map, **outline).grid(row=0, column=2, sticky="ew", padx=(4, 0))
-        self.capture_label = customtkinter.CTkLabel(flight, text="", text_color=MUTED, font=small)
-        self.capture_label.pack(pady=(0, 6))
-
-        control = card("Control")
-        self.control_switch = customtkinter.CTkSegmentedButton(control, values=["Auto", "Manual"], command=self.set_control)
-        self.control_switch.set("Auto")
-        self.control_switch.pack(fill="x", padx=14, pady=(8, 8))
-        self.mode_switch = customtkinter.CTkSegmentedButton(control, values=["Operational", "Search & Rescue"], command=self.set_mode)
-        self.mode_switch.set("Operational")
-        self.mode_switch.pack(fill="x", padx=14, pady=(0, 10))
-        self.yolo_switch = customtkinter.CTkSwitch(control, text="Person detection", command=self.toggle_yolo)
-        self.yolo_switch.select()
-        self.yolo_switch.pack(anchor="w", padx=14, pady=(0, 14))
-
-        plan = card("Flight plan")
-        self.plan_label = customtkinter.CTkLabel(plan, text="", text_color=MUTED, font=small, justify="left", anchor="w")
-        self.plan_label.pack(fill="x", padx=14, pady=(4, 6))
-        plan_buttons = customtkinter.CTkFrame(plan, fg_color="transparent")
-        plan_buttons.pack(fill="x", padx=14, pady=(0, 14))
-        plan_buttons.columnconfigure((0, 1, 2, 3), weight=1)
-        self.plan_button = customtkinter.CTkButton(plan_buttons, text="Run", width=56, fg_color=BLUE, hover_color="#4a8fc4", command=self.toggle_plan)
-        self.plan_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
-        small_outline = dict(fg_color="transparent", border_width=1, border_color="gray40", width=56)
-        for column, (text, command) in enumerate((("Clear", self.clear_plan), ("Save", self.save_plan), ("Load", self.load_plan)), start=1):
-            customtkinter.CTkButton(plan_buttons, text=text, command=command, **small_outline).grid(row=0, column=column, sticky="ew", padx=3)
-
-    def run_app(self):
-        # Ctrl+C would otherwise be swallowed by Tk callbacks and the app keeps running
-        signal.signal(signal.SIGINT, lambda *_: self.root.after(0, self.root.destroy))
+    def start(self):
         threading.Thread(target=self.detection_worker, daemon=True).start()
         threading.Thread(target=self.signal_worker, daemon=True).start()
-        try:
-            self.video_stream()
-            self.control_loop()
-            self.root.mainloop()
-        except Exception as e:
-            print(f"Error running the application: {e}")
-        finally:
-            self.cleanup()
 
     # ---- alerts -------------------------------------------------------------
 
     def set_alert(self, key, text, level="warn"):
-        if self.alerts.get(key) != (level, text):
-            self.alerts[key] = (level, text)
-            self.refresh_alert()
+        self.alerts[key] = (level, text)
 
     def clear_alert(self, key):
-        if self.alerts.pop(key, None):
-            self.refresh_alert()
+        self.alerts.pop(key, None)
 
-    def refresh_alert(self):
+    def top_alert(self):
+        """(level, text) of the most severe alert, or None."""
         if not self.alerts:
-            self.alert_label.place_forget()
-            return
-        level, text = min(self.alerts.values(), key=lambda alert: list(ALERT_COLORS).index(alert[0]))
-        more = f"   (+{len(self.alerts) - 1} more)" if len(self.alerts) > 1 else ""
-        self.alert_label.configure(text=f"{text}{more}", fg_color=ALERT_COLORS[level])
-        self.alert_label.place(in_=self.cap_lbl, relx=0.5, y=0, anchor="n", relwidth=1.0)
+            return None
+        return min(self.alerts.values(), key=lambda alert: ALERT_LEVELS.index(alert[0]))
 
     # ---- flight commands ----------------------------------------------------
 
@@ -277,6 +149,25 @@ class DroneController:
         self.yolo_enabled = not self.yolo_enabled
         self.auto_rc = [0, 0, 0, 0]
         self.detections = []
+        if not self.yolo_enabled:
+            self.follow = False
+
+    def toggle_follow(self):
+        self.follow = not self.follow
+        if self.follow:
+            self.yolo_enabled = True
+            self.cancel_return_home("Return home cancelled: following people")
+            self.stop_plan("Flight plan stopped: following people")
+
+    def hover(self):
+        """The big STOP button: stop every automatic movement and hold position. Motors keep running."""
+        self.follow = False
+        self.pressed_keys.clear()
+        self.cancel_return_home("Stopped: hovering")
+        self.stop_plan("Stopped: hovering")
+        if self.is_flying:
+            me.send_rc_control(0, 0, 0, 0)
+            self.set_alert("stop", "Stopped: hovering in place", "info")
 
     def toggle_takeoff_land(self):
         if self.is_flying:
@@ -287,11 +178,11 @@ class DroneController:
     def preflight_problems(self):
         problems = []
         if not self.link_ok:
-            problems.append("no telemetry from drone")
+            problems.append("no connection to the drone")
         if me.get_battery() < MIN_TAKEOFF_BATTERY:
             problems.append(f"battery below {MIN_TAKEOFF_BATTERY}%")
         if me.get_temperature() > MAX_TEMPERATURE:
-            problems.append(f"drone hotter than {MAX_TEMPERATURE}°C")
+            problems.append(f"drone too hot (over {MAX_TEMPERATURE}°C)")
         return problems
 
     def takeoff(self):
@@ -299,11 +190,10 @@ class DroneController:
             return
         problems = self.preflight_problems()
         if problems:
-            self.set_alert("preflight", "Preflight check failed: " + ", ".join(problems), "error")
+            self.set_alert("preflight", "Can't take off: " + ", ".join(problems), "error")
             return
-        self.clear_alert("preflight")
-        self.clear_alert("emergency")
-        self.clear_alert("home")
+        for key in ("preflight", "emergency", "home", "stop"):
+            self.clear_alert(key)
         if not self.plan_active:
             self.clear_alert("plan")
         self.auto_landed = False
@@ -319,6 +209,7 @@ class DroneController:
             return
         self.returning = False
         self.plan_active = False
+        self.follow = False
         self.run_drone_command(me.land, flying_after=False)
         self.save_flight_log()
 
@@ -327,8 +218,9 @@ class DroneController:
         me.emergency()
         self.returning = False
         self.plan_active = False
+        self.follow = False
         was_flying, self.is_flying = self.is_flying, False
-        self.set_alert("emergency", "EMERGENCY STOP: motors cut", "error")
+        self.set_alert("emergency", "EMERGENCY: motors cut", "error")
         if was_flying:
             self.save_flight_log()
 
@@ -336,14 +228,15 @@ class DroneController:
         if self.returning:
             self.cancel_return_home("Return home cancelled")
         else:
-            self.start_return_home("Returning home")
+            self.start_return_home("Coming home")
 
     def start_return_home(self, reason):
         if not self.is_flying or self.busy:
             return
         self.plan_active = False
+        self.follow = False
         self.returning = True
-        self.set_alert("home", f"{reason}: ~{self.home_distance() / 100:.1f} m to takeoff point (estimated)", "warn")
+        self.set_alert("home", f"{reason}: ~{self.home_distance() / 100:.1f} m to go", "warn")
 
     def cancel_return_home(self, message):
         if self.returning:
@@ -369,7 +262,7 @@ class DroneController:
             self.set_alert("home", "Home reached: landing", "info")
             self.land()
             return [0, 0, 0, 0]
-        self.set_alert("home", f"Returning home: ~{self.home_distance() / 100:.1f} m to go (estimated)", "warn")
+        self.set_alert("home", f"Coming home: ~{self.home_distance() / 100:.1f} m to go", "warn")
         return rc
 
     # ---- flight plan --------------------------------------------------------
@@ -386,43 +279,27 @@ class DroneController:
         stops = [(0, 0)] + self.waypoints + [(0, 0)]
         return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(stops, stops[1:]))
 
-    def update_plan_label(self):
-        if self.waypoints:
-            text = f"{len(self.waypoints)} waypoint(s) · {self.plan_length() / 100:.1f} m round trip (est.)"
-        else:
-            text = "Click the flight map to add waypoints"
-        self.plan_label.configure(text=text)
-
-    def add_waypoint(self, event):
-        if self.map_transform is None:
-            return
-        mid_x, mid_y, scale, w, h = self.map_transform
+    def add_waypoint_at(self, x, y):
         ox, oy = self.plan_origin()
-        x, y = mid_x + (event.x - w / 2) / scale, mid_y - (event.y - h / 2) / scale
         self.waypoints.append((round(x - ox), round(y - oy)))
-        self.update_plan_label()
-        self.draw_minimap()
 
-    def remove_last_waypoint(self, event=None):
+    def remove_last_waypoint(self):
         if self.waypoints and not (self.plan_active and self.plan_index >= len(self.waypoints) - 1):
             self.waypoints.pop()
-            self.update_plan_label()
-            self.draw_minimap()
 
     def clear_plan(self):
         self.stop_plan("Flight plan cleared")
         self.waypoints = []
-        self.update_plan_label()
-        self.draw_minimap()
 
     def toggle_plan(self):
         if self.plan_active:
             self.stop_plan("Flight plan stopped: hovering")
             return
         if not self.waypoints:
-            self.set_alert("plan", "Add waypoints by clicking the flight map first", "warn")
+            self.set_alert("plan", "Add waypoints by clicking the map first", "warn")
             return
         self.returning = False
+        self.follow = False
         self.plan_index = 0
         self.plan_active = True
         if not self.is_flying:
@@ -442,7 +319,7 @@ class DroneController:
             rc = self.fly_to_rc(target)
             if rc is not None:
                 distance = math.hypot(target[0] - self.x, target[1] - self.y)
-                self.set_alert("plan", f"Flight plan: waypoint {self.plan_index + 1} of {len(targets)}, ~{distance / 100:.1f} m to go", "info")
+                self.set_alert("plan", f"Flight plan: point {self.plan_index + 1} of {len(targets)}, ~{distance / 100:.1f} m to go", "info")
                 return rc
             self.plan_index += 1
         self.plan_active = False
@@ -450,28 +327,18 @@ class DroneController:
         self.start_return_home("Flight plan complete")
         return [0, 0, 0, 0]
 
-    def save_plan(self):
-        if not self.waypoints:
-            return
-        os.makedirs("plans", exist_ok=True)
-        filename = filedialog.asksaveasfilename(parent=self.root, initialdir="plans", defaultextension=".json",
-                                                filetypes=[("Flight plan", "*.json")])
-        if filename:
-            with open(filename, "w") as f:
-                json.dump({"waypoints": self.waypoints}, f)
+    def save_plan(self, filename):
+        with open(filename, "w") as f:
+            json.dump({"waypoints": self.waypoints}, f)
 
-    def load_plan(self):
-        filename = filedialog.askopenfilename(parent=self.root, initialdir="plans", filetypes=[("Flight plan", "*.json")])
-        if not filename:
-            return
+    def load_plan(self, filename):
         try:
-            self.waypoints = parse_plan(filename)
+            waypoints = parse_plan(filename)
         except (OSError, ValueError, KeyError, TypeError) as e:
             self.set_alert("plan", f"Could not load plan: {e}", "error")
             return
         self.stop_plan("Flight plan loaded")
-        self.update_plan_label()
-        self.draw_minimap()
+        self.waypoints = waypoints
 
     def run_drone_command(self, command, flying_after):
         # takeoff/land wait for the drone's reply, so keep them off the GUI thread
@@ -505,39 +372,33 @@ class DroneController:
 
     # ---- input --------------------------------------------------------------
 
-    def set_control(self, value):
-        self.cancel_return_home("Return home cancelled: control changed")
-        self.stop_plan("Flight plan stopped: control changed")
-        self.manual_control_enabled = value == "Manual"
-        self.pressed_keys.clear()
-        self.auto_rc = [0, 0, 0, 0]
-        self.keys_label.configure(text_color="gray90" if self.manual_control_enabled else MUTED)
-        self.root.focus_set()
-
-    def on_key_press(self, event):
-        key = event.keysym.lower()
+    def key_down(self, key):
+        """key: lower-case name ("up", "w", "space", ...)."""
         if key == "space":
             self.emergency_stop()
             return
         if key == "h":
             self.toggle_return_home()
             return
-        self.pressed_keys.add(key)
-        if key in KEY_BINDINGS and self.manual_control_enabled:
-            self.cancel_return_home("Return home cancelled: operator took control")
-            self.stop_plan("Flight plan stopped: operator took control")
-        if not self.manual_control_enabled:
-            return
         if key == "q":
             self.land()
-        elif key == "e":
+            return
+        if key == "e":
             self.takeoff()
+            return
+        if key in KEY_BINDINGS:
+            # flying by hand takes over from every automatic mode
+            self.follow = False
+            self.cancel_return_home("Return home cancelled: you took control")
+            self.stop_plan("Flight plan stopped: you took control")
+            self.clear_alert("stop")
+            self.pressed_keys.add(key)
 
-    def on_key_release(self, event):
-        self.pressed_keys.discard(event.keysym.lower())
+    def key_up(self, key):
+        self.pressed_keys.discard(key)
 
-    def set_mode(self, value):
-        self.current_mode = "search_and_rescue" if value == "Search & Rescue" else "operational"
+    def set_mode(self, mode):
+        self.current_mode = mode  # "operational" or "search_and_rescue"
 
     def get_keyboard_input(self):
         rc = [0, 0, 0, 0]
@@ -553,7 +414,7 @@ class DroneController:
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         filename = f'captured_images/{prefix}_{timestamp}.jpg'
         Image.fromarray(self.last_frame).save(filename)
-        self.capture_label.configure(text=f"Saved {os.path.basename(filename)}")
+        self.notice = f"Photo saved: {os.path.basename(filename)}"
         return filename
 
     def capture_image(self):
@@ -566,43 +427,32 @@ class DroneController:
             filename = f"recordings/flight_{time.strftime('%Y%m%d-%H%M%S')}.mp4"
             # shortcut: fixed 15 fps tag while real frame rate varies with YOLO load, playback speed is approximate
             self.writer = cv2.VideoWriter(filename, cv2.VideoWriter_fourcc(*"mp4v"), 15, (self.width, self.height))
-            self.record_button.configure(text="■ Stop", text_color=RED)
-            self.capture_label.configure(text=f"Recording {os.path.basename(filename)}")
+            self.notice = f"Recording {os.path.basename(filename)}"
         else:
             self.writer.release()
             self.writer = None
-            self.record_button.configure(text="Record", text_color=("gray10", "gray90"))
-            self.capture_label.configure(text="Recording saved")
+            self.notice = "Video saved in recordings/"
 
     def show_3d_map(self):
         # plotly opens in the browser; a separate process keeps the GUI responsive
         subprocess.Popen([sys.executable, "show_map_3d.py"])
 
-    # ---- loops --------------------------------------------------------------
+    # ---- loops (called by the UI's timers) -----------------------------------
 
-    def video_stream(self):
-        try:
-            self.update_status()
-            frame = cv2.resize(me.get_frame_read().frame, (self.width, self.height))
-            self.latest_frame = frame  # handed to the detection thread untouched
-            display = frame.copy()
-            if self.yolo_enabled:
-                self.draw_detections(display, self.detections)
-            self.last_frame = display
-            if self.writer is not None:
-                self.writer.write(cv2.cvtColor(display, cv2.COLOR_RGB2BGR))
-            self.search_and_rescue_capture()
-
-            imgtk = ImageTk.PhotoImage(image=Image.fromarray(display))
-            self.cap_lbl.imgtk = imgtk
-            # width/height switch from characters (placeholder text) to pixels once an image is set
-            self.cap_lbl.configure(image=imgtk, width=self.width, height=self.height)
-        except Exception:
-            traceback.print_exc()
-        finally:
-            # always reschedule, otherwise one bad frame freezes the video for good.
-            # after_idle first: a frame slower than 5ms would keep a timer always due and Tk never redraws
-            self.root.after_idle(self.root.after, 5, self.video_stream)
+    def tick_video(self):
+        """Runs safety checks and returns the next frame (RGB, with detections drawn)."""
+        self.check_link()
+        self.check_battery(me.get_battery())
+        frame = cv2.resize(me.get_frame_read().frame, (self.width, self.height))
+        self.latest_frame = frame  # handed to the detection thread untouched
+        display = frame.copy()
+        if self.yolo_enabled:
+            self.draw_detections(display, self.detections)
+        self.last_frame = display
+        if self.writer is not None:
+            self.writer.write(cv2.cvtColor(display, cv2.COLOR_RGB2BGR))
+        self.search_and_rescue_capture()
+        return display
 
     def detection_worker(self):
         # YOLO runs here so slow inference never stalls the video or the controls
@@ -620,32 +470,27 @@ class DroneController:
             except Exception:
                 traceback.print_exc()
 
-    def control_loop(self):
-        try:
-            if self.returning and self.is_flying and not self.busy:
-                rc = self.return_home_rc()
-            elif self.plan_active and self.is_flying and not self.busy:
-                rc = self.plan_rc()
-            elif self.manual_control_enabled:
-                rc = self.get_keyboard_input()
-            elif self.yolo_enabled:
-                rc = list(self.auto_rc)
-            else:
-                rc = [0, 0, 0, 0]
+    def tick_control(self):
+        """Sends one rc command; call every self.interval seconds."""
+        if self.returning and self.is_flying and not self.busy:
+            rc = self.return_home_rc()
+        elif self.plan_active and self.is_flying and not self.busy:
+            rc = self.plan_rc()
+        elif self.pressed_keys:
+            rc = self.get_keyboard_input()
+        elif self.follow and self.yolo_enabled:
+            rc = list(self.auto_rc)
+        else:
+            rc = [0, 0, 0, 0]
 
-            if self.is_flying and not self.busy:
-                if rc[2] > 0 and me.get_height() >= MAX_HEIGHT_CM:
-                    rc[2] = 0
-                    self.set_alert("ceiling", f"Height limit {MAX_HEIGHT_CM} cm reached", "warn")
-                else:
-                    self.clear_alert("ceiling")
-                me.send_rc_control(*rc)
-                self.log_flight_path(*rc)
-            self.draw_minimap()
-        except Exception:
-            traceback.print_exc()
-        finally:
-            self.root.after(int(self.interval * 1000), self.control_loop)
+        if self.is_flying and not self.busy:
+            if rc[2] > 0 and me.get_height() >= MAX_HEIGHT_CM:
+                rc[2] = 0
+                self.set_alert("ceiling", f"Height limit reached ({MAX_HEIGHT_CM / 100:.0f} m)", "warn")
+            else:
+                self.clear_alert("ceiling")
+            me.send_rc_control(*rc)
+            self.log_flight_path(*rc)
 
     def cleanup(self):
         self.running = False
@@ -671,51 +516,39 @@ class DroneController:
         if self.link_ok:
             self.clear_alert("link")
         else:
-            self.set_alert("link", "LINK LOST: no telemetry. Tello lands by itself after 15 s without commands", "error")
+            self.set_alert("link", "Lost connection! The drone will land by itself in 15 s", "error")
 
     def check_battery(self, battery):
         if self.is_flying and not self.busy and battery <= AUTO_LAND_BATTERY and not self.auto_landed:
             self.auto_landed = True
-            self.set_alert("battery", f"Battery {battery}%: landing automatically", "error")
+            self.set_alert("battery", f"Battery {battery}%: landing now", "error")
             self.land()
         elif self.is_flying and not self.busy and battery <= RTH_BATTERY and not self.rth_triggered:
             self.rth_triggered = True  # once per flight, so the operator can cancel it
-            self.set_alert("battery", f"Battery {battery}%: returning home", "warn")
+            self.set_alert("battery", f"Battery {battery}%: coming home", "warn")
             self.start_return_home("Low battery")
         elif battery <= LOW_BATTERY_WARNING:
-            self.set_alert("battery", f"Low battery {battery}%: land soon", "warn")
+            self.set_alert("battery", f"Battery low ({battery}%): land soon", "warn")
         else:
             self.clear_alert("battery")
 
-    def update_status(self):
-        self.check_link()
-        battery = me.get_battery()
-        self.check_battery(battery)
-        self.battery_label.configure(text=f"{battery}%")
-        self.battery_bar.set(battery / 100)
-        self.battery_bar.configure(progress_color=GREEN if battery > 50 else AMBER if battery > 20 else RED)
-        self.height_label.configure(text=f"{me.get_height()} cm")
-        self.signal_label.configure(text="--" if self.signal is None else str(self.signal))
-
+    def flight_state(self):
+        """(text, level) describing what the drone is doing, for the status pill."""
         if not self.link_ok:
-            state, color = "LINK LOST", RED
-        elif self.busy:
-            state, color = ("LANDING", AMBER) if self.is_flying else ("TAKING OFF", AMBER)
-        elif self.returning:
-            state, color = "RETURNING HOME", AMBER
-        elif self.plan_active and self.is_flying:
-            state, color = f"FLIGHT PLAN {min(self.plan_index + 1, len(self.waypoints))}/{len(self.waypoints)}", BLUE
-        else:
-            state, color = ("AIRBORNE", GREEN) if self.is_flying else ("LANDED", MUTED)
-        self.state_label.configure(text=f"● {state}", text_color=color)
-        control = "Manual" if self.manual_control_enabled else "Auto (searching)" if self.searching and self.is_flying else "Auto"
-        self.info_label.configure(text=f"{control} · {self.mode_switch.get()}")
-        self.home_button.configure(text="Cancel return" if self.returning else "Return home (H)")
-        self.plan_button.configure(text="Stop" if self.plan_active else "Run")
-        self.takeoff_land_button.configure(text="Land" if self.is_flying else "Take off",
-                                           fg_color=RED if self.is_flying else GREEN,
-                                           hover_color=RED_HOVER if self.is_flying else GREEN_HOVER,
-                                           state="disabled" if self.busy else "normal")
+            return "No connection", "error"
+        if self.busy:
+            return ("Landing…", "warn") if self.is_flying else ("Taking off…", "warn")
+        if not self.is_flying:
+            return "On the ground", "idle"
+        if self.returning:
+            return "Coming home", "warn"
+        if self.plan_active:
+            return f"Flight plan {min(self.plan_index + 1, len(self.waypoints))}/{len(self.waypoints)}", "plan"
+        if self.pressed_keys:
+            return "Flying by hand", "ok"
+        if self.follow:
+            return ("Looking for people", "plan") if self.searching else ("Following", "plan")
+        return "Hovering", "ok"
 
     # ---- detection & tracking ----------------------------------------------
 
@@ -774,7 +607,7 @@ class DroneController:
             forward = clamp(FB_KP * ((TARGET_AREA_MIN + TARGET_AREA_MAX) / 2 - area), 30)
         return [0, forward, up_down, yaw]
 
-    # ---- search & rescue, map, flight log ------------------------------------
+    # ---- search & rescue, flight log ---------------------------------------
 
     def search_and_rescue_capture(self):
         if self.current_mode != "search_and_rescue" or not self.is_flying or not self.detections:
@@ -795,56 +628,6 @@ class DroneController:
 
             self.points.append((self.x, self.y, self.z))
 
-    def draw_minimap(self):
-        c = self.map_canvas
-        c.delete("all")
-        w, h = int(c["width"]), int(c["height"])
-        path = [(x, y) for x, y, _ in self.points]
-        people = [(x, y) for x, y, _ in self.person_points]
-        origin = self.plan_origin()
-        targets = self.plan_targets()
-        everything = path + people + targets + [self.home, origin]
-        xs, ys = [p[0] for p in everything], [p[1] for p in everything]
-        span = max(MAP_MIN_SPAN, max(xs) - min(xs), max(ys) - min(ys))
-        scale = min(w, h) * 0.8 / span
-        mid_x, mid_y = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
-        self.map_transform = (mid_x, mid_y, scale, w, h)
-
-        def to_canvas(x, y):
-            return w / 2 + (x - mid_x) * scale, h / 2 - (y - mid_y) * scale
-
-        # 1 m grid
-        for gx in range(int((mid_x - w / 2 / scale) // 100) * 100, int(mid_x + w / 2 / scale) + 100, 100):
-            c.create_line(to_canvas(gx, 0)[0], 0, to_canvas(gx, 0)[0], h, fill="#242424")
-        for gy in range(int((mid_y - h / 2 / scale) // 100) * 100, int(mid_y + h / 2 / scale) + 100, 100):
-            c.create_line(0, to_canvas(0, gy)[1], w, to_canvas(0, gy)[1], fill="#242424")
-
-        if targets:
-            route = [origin] + targets
-            c.create_line(*[v for p in route for v in to_canvas(*p)], fill=BLUE, width=1, dash=(4, 3))
-            for i, target in enumerate(targets):
-                tx, ty = to_canvas(*target)
-                current = self.plan_active and i == self.plan_index
-                c.create_oval(tx - 7, ty - 7, tx + 7, ty + 7, fill=BLUE if current else "#1a1a1a", outline=BLUE, width=2)
-                c.create_text(tx, ty, text=str(i + 1), fill="white", font=("TkDefaultFont", 7, "bold"))
-
-        if len(path) > 1:
-            c.create_line(*[v for p in path for v in to_canvas(*p)], fill=GREEN, width=2)
-        hx, hy = to_canvas(*(self.home if self.is_flying else origin))
-        c.create_rectangle(hx - 7, hy - 7, hx + 7, hy + 7, outline=AMBER, width=2)
-        c.create_text(hx, hy, text="H", fill=AMBER, font=("TkDefaultFont", 7, "bold"))
-        for x, y in people:
-            px, py = to_canvas(x, y)
-            c.create_polygon(px, py - 6, px + 6, py, px, py + 6, px - 6, py, fill=RED)
-        px, py = to_canvas(self.x, self.y)
-        heading = math.radians(me.get_yaw() - self.yaw0)
-        c.create_line(px, py, px + 14 * math.sin(heading), py - 14 * math.cos(heading), fill="white", width=2)
-        c.create_oval(px - 4, py - 4, px + 4, py + 4, fill="white", outline="")
-        c.create_text(8, 8, anchor="nw", text="FLIGHT MAP · 1 m grid", fill="gray50", font=("TkDefaultFont", 8, "bold"))
-        c.create_text(8, h - 6, anchor="sw", text="click: add waypoint · right-click: undo", fill="gray40", font=("TkDefaultFont", 7))
-        if people:
-            c.create_text(w - 8, 8, anchor="ne", text=f"◆ {len(people)} sighting(s)", fill=RED, font=("TkDefaultFont", 8))
-
     def save_flight_log(self):
-        # first point is the pre-takeoff position; the path stays on the mini-map until the next takeoff
+        # first point is the pre-takeoff position; the path stays on the map until the next takeoff
         ccsv.make_csv(self.points[1:], detections=self.person_points)

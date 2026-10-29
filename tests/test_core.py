@@ -19,23 +19,20 @@ from show_map_3d import collapse_points
 
 
 def make_controller():
-    # skip __init__ (connects, builds the window, loads YOLO); set only what the logic uses
+    # skip __init__ (connects to the drone, loads YOLO); set only what the logic uses
     c = dc.DroneController.__new__(dc.DroneController)
     c.width, c.height, c.min_area = 640, 480, 3000
     c.interval, c.speed = 0.25, 50
     c.x, c.y, c.z, c.yaw0 = 0.0, 0.0, 0, 0
     c.home, c.returning, c.rth_triggered = (0.0, 0.0), False, False
     c.waypoints, c.plan_active, c.plan_index = [], False, 0
-    c.update_plan_label = c.draw_minimap = lambda: None
     c.points, c.person_points = [], []
     c.prev_err_x, c.searching = 0, False
     c.pressed_keys = set()
     c.is_flying, c.busy, c.auto_landed, c.link_ok = False, False, False, True
-    c.manual_control_enabled, c.yolo_enabled = False, True
+    c.follow, c.yolo_enabled = False, True
     c.auto_rc = [0, 0, 0, 0]
     c.alerts = {}
-    c.refresh_alert = lambda: None
-    c.root = mock.MagicMock()
     c.last_state, c.last_state_time = None, time.monotonic()
     return c
 
@@ -89,22 +86,70 @@ class ControlTest(unittest.TestCase):
 
     def test_climb_blocked_above_height_limit(self):
         c = make_controller()
-        c.is_flying, c.manual_control_enabled, c.pressed_keys = True, True, {"w"}
-        c.draw_minimap = lambda: None
+        c.is_flying, c.pressed_keys = True, {"w"}
         with mock.patch.object(dc.me, "get_height", return_value=dc.MAX_HEIGHT_CM), \
                 mock.patch.object(dc.me, "send_rc_control") as send:
-            c.control_loop()
+            c.tick_control()
         send.assert_called_once_with(0, 0, 0, 0)
         self.assertIn("ceiling", c.alerts)
 
     def test_no_commands_while_landed_or_busy(self):
         c = make_controller()
-        c.draw_minimap = lambda: None
         with mock.patch.object(dc.me, "send_rc_control") as send:
-            c.control_loop()
+            c.tick_control()
             c.is_flying, c.busy = True, True
-            c.control_loop()
+            c.tick_control()
         send.assert_not_called()
+
+
+class SimpleControlsTest(unittest.TestCase):
+    def test_follow_flies_auto_rc_only_when_enabled(self):
+        c = make_controller()
+        c.is_flying, c.auto_rc = True, [0, 10, 0, 20]
+        with mock.patch.object(dc.me, "send_rc_control") as send:
+            c.tick_control()                      # not following: hover
+            c.toggle_follow()
+            c.tick_control()                      # following: tracking commands
+        self.assertEqual(send.call_args_list, [mock.call(0, 0, 0, 0), mock.call(0, 10, 0, 20)])
+
+    def test_arrow_key_takes_over_and_release_hovers(self):
+        c = make_controller()
+        c.is_flying, c.follow, c.auto_rc = True, True, [0, 10, 0, 20]
+        c.key_down("up")
+        self.assertFalse(c.follow)
+        self.assertEqual(c.flight_state()[0], "Flying by hand")
+        with mock.patch.object(dc.me, "send_rc_control") as send:
+            c.tick_control()
+            c.key_up("up")
+            c.tick_control()
+        self.assertEqual(send.call_args_list, [mock.call(0, 50, 0, 0), mock.call(0, 0, 0, 0)])
+
+    def test_stop_hovers_and_never_cuts_motors(self):
+        c = make_controller()
+        c.is_flying, c.follow, c.returning, c.plan_active = True, True, True, True
+        with mock.patch.object(dc.me, "emergency") as emergency, mock.patch.object(dc.me, "send_rc_control") as send:
+            c.hover()
+        emergency.assert_not_called()
+        send.assert_called_once_with(0, 0, 0, 0)
+        self.assertFalse(c.follow or c.returning or c.plan_active)
+        self.assertTrue(c.is_flying)
+
+    def test_space_is_the_emergency_motor_cut(self):
+        c = make_controller()
+        c.is_flying = True
+        c.save_flight_log = mock.MagicMock()
+        with mock.patch.object(dc.me, "emergency") as emergency:
+            c.key_down("space")
+        emergency.assert_called_once()
+        self.assertFalse(c.is_flying)
+
+    def test_flight_state_texts(self):
+        c = make_controller()
+        self.assertEqual(c.flight_state(), ("On the ground", "idle"))
+        c.is_flying = True
+        self.assertEqual(c.flight_state(), ("Hovering", "ok"))
+        c.link_ok = False
+        self.assertEqual(c.flight_state()[1], "error")
 
 
 class SafetyTest(unittest.TestCase):
@@ -195,8 +240,8 @@ class ReturnHomeTest(unittest.TestCase):
 
     def test_manual_key_cancels_return(self):
         c = make_controller()
-        c.is_flying, c.returning, c.manual_control_enabled = True, True, True
-        c.on_key_press(mock.Mock(keysym="Up"))
+        c.is_flying, c.returning = True, True
+        c.key_down("up")
         self.assertFalse(c.returning)
 
 
@@ -252,8 +297,8 @@ class FlightPlanTest(unittest.TestCase):
 
     def test_manual_key_and_low_battery_stop_the_plan(self):
         c = make_controller()
-        c.is_flying, c.plan_active, c.manual_control_enabled, c.waypoints = True, True, True, [(0, 500)]
-        c.on_key_press(mock.Mock(keysym="Left"))
+        c.is_flying, c.plan_active, c.waypoints = True, True, [(0, 500)]
+        c.key_down("left")
         self.assertFalse(c.plan_active)
         c.plan_active, c.x = True, 300.0
         c.check_battery(dc.RTH_BATTERY)
