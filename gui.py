@@ -32,9 +32,6 @@ QPushButton:hover {{ background: #272a2f; border-color: #3a3e45; }}
 QPushButton:pressed {{ background: #2d3036; }}
 QPushButton:checked {{ border-color: {ACCENT}; color: {ACCENT}; }}
 QPushButton:disabled {{ color: {FAINT}; border-color: #24262a; background: #1a1b1e; }}
-QPushButton#Flat {{ background: transparent; border: none; color: {MUTED}; padding: 6px 10px; }}
-QPushButton#Flat:hover {{ color: {TEXT}; }}
-QPushButton#Flat:checked {{ color: {TEXT}; }}
 QPushButton#Big {{ font-size: 17px; font-weight: 600; min-height: 60px; padding: 0 20px; }}
 QPushButton#Big[tone="primary"] {{ background: {ACCENT}; border: none; color: white; }}
 QPushButton#Big[tone="primary"]:hover {{ background: #3f7ce8; }}
@@ -267,7 +264,6 @@ class MainWindow(QWidget):
         battery_box, self.battery = readout("BATTERY")
         height_box, self.height_value = readout("HEIGHT")
         signal_box, self.signal_value = readout("SIGNAL")
-        self.more_button = button("More", self.toggle_more, "Flat", checkable=True)
         top.addWidget(label("GÖKBAĞ", "Title"))
         top.addWidget(divider())
         top.addLayout(state)
@@ -275,8 +271,6 @@ class MainWindow(QWidget):
         top.addWidget(self.notice)
         for box in (battery_box, height_box, signal_box):
             top.addLayout(box)
-        top.addWidget(divider())
-        top.addWidget(self.more_button)
 
         # video + the four controls a beginner needs
         self.video = VideoView()
@@ -298,11 +292,11 @@ class MainWindow(QWidget):
         main.addLayout(controls)
         main.addWidget(hint)
 
-        # "More" side panel
-        self.more = QFrame()
-        self.more.setObjectName("Panel")
-        self.more.setFixedWidth(360)
-        more = QVBoxLayout(self.more)
+        # side panel: map, flight plan, camera, mission
+        self.side = QFrame()
+        self.side.setObjectName("Panel")
+        self.side.setFixedWidth(360)
+        more = QVBoxLayout(self.side)
         more.setContentsMargins(16, 16, 16, 16)
         more.setSpacing(8)
 
@@ -349,13 +343,12 @@ class MainWindow(QWidget):
         more.addSpacing(10)
         more.addWidget(button("Emergency motor cut (Space)", self.c.emergency_stop, "Danger"))
         more.addWidget(label("Motors stop immediately and the drone falls.", "Muted"))
-        self.more.hide()
 
         root = QHBoxLayout(self)
         root.setContentsMargins(20, 16, 20, 16)
         root.setSpacing(16)
         root.addLayout(main, 1)
-        root.addWidget(self.more)
+        root.addWidget(self.side)
 
         self.video_timer = QTimer(self, timeout=self.tick_video, interval=15)
         self.control_timer = QTimer(self, timeout=self.tick_control, interval=int(self.c.interval * 1000))
@@ -378,8 +371,7 @@ class MainWindow(QWidget):
     def tick_control(self):
         try:
             self.c.tick_control()
-            if self.more.isVisible():
-                self.map.update()
+            self.map.update()
         except Exception:
             traceback.print_exc()
 
@@ -421,9 +413,6 @@ class MainWindow(QWidget):
             self.plan_label.setText("Click the map to add points for the drone to visit.")
 
     # ---- actions ------------------------------------------------------------
-
-    def toggle_more(self):
-        self.more.setVisible(self.more_button.isChecked())
 
     def save_plan(self):
         if not self.c.waypoints:

@@ -1,11 +1,13 @@
 import signal
 import sys
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QLoggingCategory
 from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox
 from gui import STYLE, MainWindow
 from login import LoginDialog
 
 if __name__ == "__main__":
+    # Known harmless Qt-on-Wayland notice when a window with a text field closes (the login); typing is unaffected
+    QLoggingCategory.setFilterRules("qt.qpa.wayland.textinput=false")
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLE)
     # Ctrl+C in the terminal closes the window (which lands the drone) instead of being ignored

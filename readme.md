@@ -48,7 +48,7 @@ GOKBAG_SIM=path/to/video.mp4 python main.py  # video file, loops
 ```
 
 __The main screen:__
-A big video with four buttons underneath: **Take off / Land**, **Come home**, **Follow people** and a red **Stop**. Stop makes the drone stop moving and hover in place; it never turns the motors off. Battery, height and signal are shown at the top, and alerts appear over the video. Everything else (map, flight plans, camera, mission mode, emergency motor cut) is in the **More** panel.
+A big video with four buttons underneath: **Take off / Land**, **Come home**, **Follow people** and a red **Stop**. Stop makes the drone stop moving and hover in place; it never turns the motors off. Battery, height and signal are shown at the top, and alerts appear over the video. The side panel holds the map, flight plans, camera, mission mode and the emergency motor cut.
 
 __Flying by hand:__
 Hold the arrow keys to move, W/S to go up/down, A/D to turn; let go and the drone hovers. Pressing a movement key always takes over from Follow, Come home and flight plans. E takes off, Q lands, H comes home.
@@ -57,7 +57,7 @@ __Follow people:__
 The drone keeps the group of detected people centred (smooth proportional control) and holds a set distance. With nobody in view it turns in place to search. Detection runs in a background thread so video and controls stay smooth.
 
 __Flight Plans (waypoints):__
-Open More and click the map to add points (right-click removes the last one); positions are relative to the takeoff point, with "up" on the map being the direction the drone faces at takeoff. The grid is 1 m. "Fly plan" takes off if needed, flies to each waypoint in order, then returns home and lands. Combined with Search & Rescue mode this scans an area and marks sightings on the map. Movement keys, STOP, low battery or "Stop plan" end the plan. Plans can be saved to and loaded from `plans/*.json`. Like return home, positions are estimated (no GPS), so expect drift of a meter or two.
+Click the map in the side panel to add points (right-click removes the last one); positions are relative to the takeoff point, with "up" on the map being the direction the drone faces at takeoff. The grid is 1 m. "Fly plan" takes off if needed, flies to each waypoint in order, then returns home and lands. Combined with Search & Rescue mode this scans an area and marks sightings on the map. Movement keys, STOP, low battery or "Stop plan" end the plan. Plans can be saved to and loaded from `plans/*.json`. Like return home, positions are estimated (no GPS), so expect drift of a meter or two.
 
 __Mission Modes:__
 Operational labels people as Ally (large/close) or Hostile (small/far); this is a size heuristic, not identification. Search & Rescue labels everyone "Person Detected", saves a photo every 3 s while people are in view in flight, and marks each sighting on the flight map.
@@ -68,14 +68,14 @@ __Safety:__
 - Come home (H key or button): turns toward the takeoff point, flies back and lands. There is no GPS: the position is estimated from the commands flown, so expect to land within roughly a meter or two of the takeoff point. Any manual movement key cancels it. It cannot work after a link loss, since commands use the same Wi-Fi.
 - Link watchdog: shows LINK LOST when telemetry stops for 2 s (the Tello itself lands after 15 s without commands).
 - Height limit of 400 cm.
-- Emergency motor cut with SPACE or the red-outlined button in More: the motors stop at once and the drone falls. Use it only when hovering is not safe.
+- Emergency motor cut with SPACE or the red-outlined button in the side panel: the motors stop at once and the drone falls. Use it only when hovering is not safe.
 - Alerts appear as a banner over the video.
 
 __Login:__
 Passwords are hashed with bcrypt; older SHA-256 records upgrade automatically on the next login. Five failed attempts lock that username for 30 s.
 
 __Flight Data Logging:__
-Flight paths are saved as encrypted CSV files in the flight_logs directory on every landing. The key is kept outside the repository at `~/.config/gokbag/flight_log.key` (override with `GOKBAG_LOG_KEY_FILE`); back it up, logs cannot be read without it. The map in More shows the path during flight; Record saves the video to `recordings/`. View a log in 3D with the "3D map" button or:
+Flight paths are saved as encrypted CSV files in the flight_logs directory on every landing. The key is kept outside the repository at `~/.config/gokbag/flight_log.key` (override with `GOKBAG_LOG_KEY_FILE`); back it up, logs cannot be read without it. The map in the side panel shows the path during flight; Record saves the video to `recordings/`. View a log in 3D with the "3D map" button or:
 ```bash
 python show_map_3d.py [flight_logs/<file>.csv]   # newest log if omitted
 ```
